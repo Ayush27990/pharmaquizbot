@@ -3,9 +3,8 @@ import json
 import re
 import logging
 import asyncio
-from datetime import datetime
-from telegram import Bot
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 from groq import Groq
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -14,13 +13,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
-
-if not TELEGRAM_TOKEN:
-    raise ValueError("TELEGRAM_TOKEN is missing")
-if not GROQ_API_KEY:
-    raise ValueError("GROQ_API_KEY is missing")
-if not CHANNEL_ID:
-    raise ValueError("CHANNEL_ID is missing")
+ADMIN_ID = 723919716
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
@@ -48,6 +41,7 @@ TOPICS = [
 ]
 
 topic_index = 0
+pending_questions = {}
 
 def escape_md(text):
     for ch in ["_", "*", "[", "]", "(", ")", "~", "`", ">", "#", "+", "-", "=", "|", "{", "}", ".", "!"]:
@@ -67,22 +61,19 @@ def extract_json(text):
 async def generate_question(topic):
     prompt = f"""You are an expert medical educator.
 Generate exactly 1 high-quality multiple-choice question about: {topic}
-
 Rules:
 - Four options
 - One correct answer
 - Clinical or applied style
 - Detailed explanation
 - Explain why each wrong option is incorrect
-
-Return ONLY JSON in this format:
+Return ONLY JSON:
 [{{
   "question": "...",
   "options": ["A) ...", "B) ...", "C) ...", "D) ..."],
   "answer_index": 0,
   "explanation": "Correct: A because... B is wrong because... C is wrong because... D is wrong because..."
 }}]"""
-
     response = groq_client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[{"role": "user", "content": prompt}]
@@ -90,6 +81,87 @@ Return ONLY JSON in this format:
     raw = response.choices[0].message.content
     questions = extract_json(raw)
     return questions[0] if questions else None
+
+async def send_for_approval(context, question, topic):
+    global pending_questions
+    preview = (
+        f"📋 *NEW QUESTION FOR APPROVAL*\n\n"
+        f"📚 Topic: {topic}\n\n"
+        f"*{question['question']}*\n\n"
+        + "\n".join(question["options"]) +
+        f"\n\n✅ Correct: {question['options'][question['answer_index']]}\n\n"
+        f"💡 Explanation: {question['explanation']}"
+    )
+    import time
+    question_id = str(int(time.time()))
+    pending_questions[question_id] = {
+        "question": question,
+        "topic": topic
+    }
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Approve & Post", callback_data=f"approve_{question_id}"),
+            InlineKeyboardButton("❌ Reject", callback_data=f"reject_{question_id}")
+        ]
+    ])
+    await context.bot.send_message(
+        chat_id=ADMIN_ID,
+        text=preview,
+        parse_mode="Markdown",
+        reply_markup=keyboard
+    )
+
+async def post_to_channel(context, question, topic):
+    text_msg = (
+        f"📚 *{topic.upper()}*\n\n"
+        f"*{question['question']}*\n\n"
+        + "\n".join(question["options"])
+    )
+    await context.bot.send_message(
+        chat_id=CHANNEL_ID,
+        text=text_msg,
+        parse_mode="Markdown"
+    )
+    await asyncio.sleep(2)
+    clean_options = []
+    for opt in question["options"]:
+        if len(opt) > 2 and opt[1] == ")":
+            clean_options.append(opt[3:].strip())
+        else:
+            clean_options.append(opt)
+    await context.bot.send_poll(
+        chat_id=CHANNEL_ID,
+        question=question["question"][:300],
+        options=clean_options,
+        type="quiz",
+        correct_option_id=int(question["answer_index"]),
+        is_anonymous=True
+    )
+    await asyncio.sleep(2)
+    explanation_escaped = escape_md(question["explanation"])
+    spoiler_text = f"💡 Explanation:\n\n||{explanation_escaped}||"
+    await context.bot.send_message(
+        chat_id=CHANNEL_ID,
+        text=spoiler_text,
+        parse_mode="MarkdownV2"
+    )
+
+async def handle_callback(update, context):
+    global topic_index
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    if data.startswith("approve_"):
+        question_id = data.replace("approve_", "")
+        if question_id in pending_questions:
+            item = pending_questions.pop(question_id)
+            await post_to_channel(context, item["question"], item["topic"])
+            await query.edit_message_text("✅ Question approved and posted to channel!")
+    elif data.startswith("reject_"):
+        question_id = data.replace("reject_", "")
+        if question_id in pending_questions:
+            pending_questions.pop(question_id)
+            await query.edit_message_text("❌ Question rejected. Next one will come in 15 minutes.")
 
 async def send_scheduled_quiz(context):
     global topic_index
@@ -101,61 +173,37 @@ async def send_scheduled_quiz(context):
         if not question:
             logger.error("Failed to generate question")
             return
-        text_msg = (
-            f"📚 *{topic.upper()}*\n\n"
-            f"*{question['question']}*\n\n"
-            + "\n".join(question["options"])
-        )
-        await context.bot.send_message(
-            chat_id=CHANNEL_ID,
-            text=text_msg,
-            parse_mode="Markdown"
-        )
-        await asyncio.sleep(2)
-        await context.bot.send_poll(
-            chat_id=CHANNEL_ID,
-            question=question["question"][:300],
-            options=[opt[3:] if opt[1] == ")" else opt for opt in question["options"]],
-            type="quiz",
-            correct_option_id=int(question["answer_index"]),
-            is_anonymous=True,
-            explanation=question["explanation"][:200] if len(question["explanation"]) <= 200 else None
-        )
-        await asyncio.sleep(2)
-        explanation = question["explanation"]
-        result_escaped = escape_md("💡 Explanation:")
-        explanation_escaped = escape_md(explanation)
-        spoiler_text = f"{result_escaped}\n\n||{explanation_escaped}||"
-        await context.bot.send_message(
-            chat_id=CHANNEL_ID,
-            text=spoiler_text,
-            parse_mode="MarkdownV2"
-        )
-        logger.info(f"Successfully sent quiz on: {topic}")
+        await send_for_approval(context, question, topic)
+        logger.info(f"Question sent for approval: {topic}")
     except Exception as e:
-        logger.error(f"Error sending quiz: {e}")
+        logger.error(f"Error: {e}")
 
 async def start(update, context):
-    await update.message.reply_text(
-        "✅ Pharma Quiz Bot is running!\n"
-        "Sending Biochemistry & Pharmacology MCQs every 15 minutes to the channel."
-    )
+    if update.effective_user.id == ADMIN_ID:
+        await update.message.reply_text(
+            "✅ Pharma Quiz Bot is running!\n"
+            "Questions will be sent to you every 15 minutes for approval.\n\n"
+            "Commands:\n"
+            "/postnow - Generate a question now"
+        )
 
 async def post_now(update, context):
-    await send_scheduled_quiz(context)
-    await update.message.reply_text("✅ Question posted!")
+    if update.effective_user.id == ADMIN_ID:
+        await update.message.reply_text("⏳ Generating question...")
+        await send_scheduled_quiz(context)
 
 def main():
-    logger.info("Starting Pharma Quiz Scheduler Bot...")
+    logger.info("Starting Pharma Quiz Bot...")
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("postnow", post_now))
+    app.add_handler(CallbackQueryHandler(handle_callback))
     app.job_queue.run_repeating(
         send_scheduled_quiz,
         interval=900,
         first=10
     )
-    logger.info("Scheduler started - posting every 15 minutes")
+    logger.info("Bot started!")
     app.run_polling()
 
 if __name__ == "__main__":
