@@ -199,7 +199,7 @@ def main():
    app.add_handler(CallbackQueryHandler(handle_callback))
    app.job_queue.run_repeating(
        send_scheduled_quiz,
-       interval=60,
+       interval=1800,
        first=10
    )
    logger.info("Bot started!")
