@@ -352,7 +352,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
        "Features:\n"
        "🤖 AI generates topics automatically\n"
        "✅ AI validates quality\n"
-       "👨 You approve before posting\n"
+       "👨‍⚕️ You approve before posting\n"
        "🔄 Regenerate if not satisfied\n"
        "📄 Send PDF to generate MCQ\n\n"
        "Commands:\n"
