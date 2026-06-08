@@ -1,3 +1,5 @@
-python-telegram-bot[job-queue]==21.11.1
+python-telegram-bot==20.7
 groq
 PyPDF2
+flask
+apscheduler
