@@ -1,5 +1,0 @@
-[phases.install]
-cmds = [
-  "rm -rf /app/.venv",
-  "pip install --no-cache-dir -r requirements.txt"
-]
