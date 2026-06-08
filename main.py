@@ -1,209 +1,276 @@
 import os
 import json
 import re
+import time
+import random
 import logging
 import asyncio
-import time
+import fitz  # PyMuPDF
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters
+)
+
 from groq import Groq
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+# ======================
+# CONFIG
+# ======================
+logging.basicConfig(level=logging.INFO)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
+
 ADMIN_ID = 723919716
 
-groq_client = Groq(api_key=GROQ_API_KEY)
+client = Groq(api_key=GROQ_API_KEY)
 
-TOPICS = [
-   "Biochemistry enzymes and cofactors",
-   "Pharmacology beta blockers",
-   "Biochemistry amino acid metabolism",
-   "Pharmacology antibiotics mechanism",
-   "Biochemistry lipid metabolism",
-   "Pharmacology antihypertensive drugs",
-   "Biochemistry carbohydrate metabolism",
-   "Pharmacology antifungal drugs",
-   "Biochemistry DNA replication",
-   "Pharmacology diuretics",
-   "Biochemistry vitamins and deficiencies",
-   "Pharmacology antidiabetic drugs",
-   "Biochemistry urea cycle",
-   "Pharmacology anticoagulants",
-   "Biochemistry electron transport chain",
-   "Pharmacology antiepileptic drugs",
-   "Biochemistry protein synthesis",
-   "Pharmacology antipsychotic drugs",
-   "Biochemistry glycolysis",
-   "Pharmacology NSAIDs mechanism",
-]
-
-topic_index = 0
 pending_questions = {}
 
-def escape_md(text):
-   for ch in ["_", "*", "[", "]", "(", ")", "~", "`", ">", "#", "+", "-", "=", "|", "{", "}", ".", "!"]:
-       text = text.replace(ch, f"\\{ch}")
-   return text
+# ======================
+# PDF TEXT EXTRACTION
+# ======================
+def extract_text(pdf_path):
+    doc = fitz.open(pdf_path)
+    text = ""
+    for page in doc:
+        text += page.get_text()
+    return text[:12000]
 
+# ======================
+# PDF IMAGE EXTRACTION
+# ======================
+def extract_images(pdf_path):
+    doc = fitz.open(pdf_path)
+    images = []
+
+    for page_index in range(len(doc)):
+        for img in doc[page_index].get_images(full=True):
+            xref = img[0]
+            base = doc.extract_image(xref)
+            img_bytes = base["image"]
+
+            img_path = f"/tmp/img_{page_index}_{xref}.png"
+
+            with open(img_path, "wb") as f:
+                f.write(img_bytes)
+
+            images.append(img_path)
+
+    return images
+
+# ======================
+# JSON PARSER
+# ======================
 def extract_json(text):
-   try:
-       match = re.search(r"\[.*\]", text, re.DOTALL)
-       if not match:
-           return []
-       return json.loads(match.group())
-   except Exception as e:
-       logger.error(f"JSON extraction error: {e}")
-       return []
+    try:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if not match:
+            return None
+        return json.loads(match.group())
+    except:
+        return None
 
-async def generate_question(topic):
-   prompt = f"""You are an expert medical educator.
-Generate exactly 1 high-quality multiple-choice question about: {topic}
+# ======================
+# MCQ GENERATOR (GROQ)
+# ======================
+async def generate_mcq(content, mode="text"):
+    prompt = f"""
+You are a NEET PG / INICET examiner.
+
+Generate ONE HIGH-YIELD clinical MCQ.
+
+Mode: {mode}
+
+CONTENT:
+{content}
+
 Rules:
-- Four options
-- One correct answer
-- Clinical or applied style
-- Detailed explanation
-- Explain why each wrong option is incorrect
+- Clinical vignette style preferred
+- 4 options (A–D)
+- Only one correct answer
+- Very high difficulty
+- Explanation must cover all options
+
 Return ONLY JSON:
-[{{
+
+{{
  "question": "...",
  "options": ["A) ...", "B) ...", "C) ...", "D) ..."],
  "answer_index": 0,
- "explanation": "Correct: A because... B is wrong because... C is wrong because... D is wrong because..."
-}}]"""
-   response = groq_client.chat.completions.create(
-       model="llama-3.3-70b-versatile",
-       messages=[{"role": "user", "content": prompt}]
-   )
-   raw = response.choices[0].message.content
-   questions = extract_json(raw)
-   return questions[0] if questions else None
+ "explanation": "..."
+}}
+"""
 
-async def send_for_approval(context, question, topic):
-   preview = (
-       f"📋 *NEW QUESTION FOR APPROVAL*\n\n"
-       f"📚 Topic: {topic}\n\n"
-       f"*{question['question']}*\n\n"
-       + "\n".join(question["options"]) +
-       f"\n\n✅ Correct: {question['options'][question['answer_index']]}\n\n"
-       f"💡 Explanation: {question['explanation']}"
-   )
-   question_id = str(int(time.time()))
-   pending_questions[question_id] = {
-       "question": question,
-       "topic": topic
-   }
-   keyboard = InlineKeyboardMarkup([
-       [
-           InlineKeyboardButton("✅ Approve & Post", callback_data=f"approve_{question_id}"),
-           InlineKeyboardButton("❌ Reject", callback_data=f"reject_{question_id}")
-       ]
-   ])
-   await context.bot.send_message(
-       chat_id=ADMIN_ID,
-       text=preview,
-       parse_mode="Markdown",
-       reply_markup=keyboard
-   )
+    response = client.chat.completions.create(
+        model="llama3-70b-8192",
+        messages=[{"role": "user", "content": prompt}]
+    )
 
-async def post_to_channel(context, question, topic):
-   text_msg = (
-       f"📚 *{topic.upper()}*\n\n"
-       f"*{question['question']}*\n\n"
-       + "\n".join(question["options"])
-   )
-   await context.bot.send_message(
-       chat_id=CHANNEL_ID,
-       text=text_msg,
-       parse_mode="Markdown"
-   )
-   await asyncio.sleep(2)
-   clean_options = []
-   for opt in question["options"]:
-       if len(opt) > 2 and opt[1] == ")":
-           clean_options.append(opt[3:].strip())
-       else:
-           clean_options.append(opt)
-   await context.bot.send_poll(
-       chat_id=CHANNEL_ID,
-       question=question["question"][:300],
-       options=clean_options,
-       type="quiz",
-       correct_option_id=int(question["answer_index"]),
-       is_anonymous=True
-   )
-   await asyncio.sleep(2)
-   explanation_escaped = escape_md(question["explanation"])
-   spoiler_text = f"💡 Explanation:\n\n||{explanation_escaped}||"
-   await context.bot.send_message(
-       chat_id=CHANNEL_ID,
-       text=spoiler_text,
-       parse_mode="MarkdownV2"
-   )
+    return extract_json(response.choices[0].message.content)
 
+# ======================
+# REVIEWER (QUALITY FILTER)
+# ======================
+async def review_mcq(mcq):
+    prompt = f"""
+You are a NEET PG question reviewer.
+
+Evaluate:
+
+Q: {mcq['question']}
+Options: {mcq['options']}
+Explanation: {mcq['explanation']}
+
+Score 1-10 based on:
+- Clinical relevance
+- Difficulty
+- Distractors quality
+
+Return JSON:
+{{
+ "score": 0,
+ "approved": false
+}}
+"""
+
+    response = client.chat.completions.create(
+        model="llama3-70b-8192",
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    return extract_json(response.choices[0].message.content)
+
+# ======================
+# ADMIN APPROVAL
+# ======================
+async def send_for_approval(context, mcq, source):
+    qid = str(int(time.time()))
+    pending_questions[qid] = mcq
+
+    text = (
+        f"📋 NEW HIGH-YIELD MCQ\n\n"
+        f"📚 Source: {source}\n\n"
+        f"{mcq['question']}\n\n"
+        + "\n".join(mcq["options"]) +
+        f"\n\n💡 {mcq['explanation']}"
+    )
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Approve", callback_data=f"approve_{qid}"),
+            InlineKeyboardButton("❌ Reject", callback_data=f"reject_{qid}")
+        ]
+    ])
+
+    await context.bot.send_message(
+        chat_id=ADMIN_ID,
+        text=text,
+        reply_markup=keyboard
+    )
+
+# ======================
+# PDF HANDLER
+# ======================
+async def handle_pdf(update, context):
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    file = await update.message.document.get_file()
+    path = f"/tmp/{update.message.document.file_name}"
+    await file.download_to_drive(path)
+
+    await update.message.reply_text("📄 PDF received. Processing...")
+
+    text = extract_text(path)
+    images = extract_images(path)
+
+    # 1️⃣ Generate MCQ from TEXT
+    mcq_text = await generate_mcq(text, mode="text")
+
+    # 2️⃣ Generate MCQ from IMAGE if available
+    mcq_image = None
+    if images:
+        mcq_image = await generate_mcq("Image-based medical diagram", mode="image")
+
+    # REVIEW STEP
+    for mcq in [mcq_text, mcq_image]:
+        if not mcq:
+            continue
+
+        review = await review_mcq(mcq)
+
+        if review and review.get("score", 0) >= 8:
+            await send_for_approval(context, mcq, "PDF")
+        else:
+            await update.message.reply_text("⚠️ Low quality MCQ rejected automatically")
+
+# ======================
+# CALLBACK HANDLER
+# ======================
 async def handle_callback(update, context):
-   global topic_index
-   query = update.callback_query
-   await query.answer()
-   data = query.data
-   if data.startswith("approve_"):
-       question_id = data.replace("approve_", "")
-       if question_id in pending_questions:
-           item = pending_questions.pop(question_id)
-           await post_to_channel(context, item["question"], item["topic"])
-           await query.edit_message_text("✅ Question approved and posted to channel!")
-   elif data.startswith("reject_"):
-       question_id = data.replace("reject_", "")
-       if question_id in pending_questions:
-           pending_questions.pop(question_id)
-           await query.edit_message_text("❌ Question rejected. Next one will come in 1 minute.")
+    query = update.callback_query
+    await query.answer()
 
-async def send_scheduled_quiz(context):
-   global topic_index
-   try:
-       topic = TOPICS[topic_index % len(TOPICS)]
-       topic_index += 1
-       logger.info(f"Generating question on: {topic}")
-       question = await generate_question(topic)
-       if not question:
-           logger.error("Failed to generate question")
-           return
-       await send_for_approval(context, question, topic)
-       logger.info(f"Question sent for approval: {topic}")
-   except Exception as e:
-       logger.error(f"Error: {e}")
+    data = query.data
 
+    if data.startswith("approve_"):
+        qid = data.split("_")[1]
+        mcq = pending_questions.get(qid)
+
+        if mcq:
+            text = (
+                f"📚 APPROVED MCQ\n\n"
+                f"{mcq['question']}\n\n"
+                + "\n".join(mcq["options"]) +
+                f"\n\n💡 Explanation:\n||{mcq['explanation']}||"
+            )
+
+            await context.bot.send_message(
+                chat_id=CHANNEL_ID,
+                text=text
+            )
+
+        pending_questions.pop(qid, None)
+        await query.edit_message_text("✅ Posted to channel")
+
+    elif data.startswith("reject_"):
+        qid = data.split("_")[1]
+        pending_questions.pop(qid, None)
+        await query.edit_message_text("❌ Rejected")
+
+# ======================
+# START
+# ======================
 async def start(update, context):
-   if update.effective_user.id == ADMIN_ID:
-       await update.message.reply_text(
-           "✅ Pharma Quiz Bot is running!\n"
-           "Questions will be sent to you every 1 minute for approval.\n\n"
-           "Commands:\n"
-           "/postnow - Generate a question now"
-       )
+    await update.message.reply_text(
+        "🚀 Bot running:\n\n"
+        "✔ PDF MCQ extraction\n"
+        "✔ Image MCQ support\n"
+        "✔ AI review system\n"
+        "✔ Admin approval system"
+    )
 
-async def post_now(update, context):
-   if update.effective_user.id == ADMIN_ID:
-       await update.message.reply_text("⏳ Generating question...")
-       await send_scheduled_quiz(context)
-
+# ======================
+# MAIN
+# ======================
 def main():
-   logger.info("Starting Pharma Quiz Bot...")
-   app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-   app.add_handler(CommandHandler("start", start))
-   app.add_handler(CommandHandler("postnow", post_now))
-   app.add_handler(CallbackQueryHandler(handle_callback))
-   app.job_queue.run_repeating(
-       send_scheduled_quiz,
-       interval=1800,
-       first=10
-   )
-   logger.info("Bot started!")
-   app.run_polling()
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(handle_callback))
+
+    app.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
+
+    print("Bot running...")
+    app.run_polling()
 
 if __name__ == "__main__":
-   main()
+    main()
