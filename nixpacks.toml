@@ -1,4 +1,5 @@
+[phases.setup]
+nixPkgs = ["python313"]
+
 [phases.install]
-cmds = [
-  "pip install --no-cache-dir -r requirements.txt"
-]
+cmds = ["pip install --no-cache-dir -r requirements.txt"]
