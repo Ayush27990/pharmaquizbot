@@ -4,7 +4,7 @@ import re
 import time
 import random
 import logging
-import asyncio
+
 import fitz  # PyMuPDF
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -35,36 +35,20 @@ client = Groq(api_key=GROQ_API_KEY)
 pending_questions = {}
 
 # ======================
-# PDF TEXT EXTRACTION
+# HIGH-YIELD TOPICS
 # ======================
-def extract_text(pdf_path):
-    doc = fitz.open(pdf_path)
-    text = ""
-    for page in doc:
-        text += page.get_text()
-    return text[:12000]
-
-# ======================
-# PDF IMAGE EXTRACTION
-# ======================
-def extract_images(pdf_path):
-    doc = fitz.open(pdf_path)
-    images = []
-
-    for page_index in range(len(doc)):
-        for img in doc[page_index].get_images(full=True):
-            xref = img[0]
-            base = doc.extract_image(xref)
-            img_bytes = base["image"]
-
-            img_path = f"/tmp/img_{page_index}_{xref}.png"
-
-            with open(img_path, "wb") as f:
-                f.write(img_bytes)
-
-            images.append(img_path)
-
-    return images
+TOPICS = [
+    "G6PD deficiency hemolysis oxidative stress",
+    "Pyruvate kinase deficiency anemia",
+    "Acute intermittent porphyria heme synthesis",
+    "Maple syrup urine disease amino acid metabolism",
+    "Ornithine transcarbamylase deficiency urea cycle",
+    "Warfarin vitamin K cycle mechanism",
+    "Organophosphate poisoning acetylcholinesterase inhibition",
+    "Phenytoin toxicity cerebellar signs",
+    "Methotrexate toxicity folate metabolism",
+    "Tumor lysis syndrome hyperuricemia",
+]
 
 # ======================
 # JSON PARSER
@@ -79,28 +63,27 @@ def extract_json(text):
         return None
 
 # ======================
-# MCQ GENERATOR (GROQ)
+# GROQ MCQ GENERATION
 # ======================
-async def generate_mcq(content, mode="text"):
+async def generate_mcq(content, mode="auto"):
     prompt = f"""
 You are a NEET PG / INICET examiner.
 
-Generate ONE HIGH-YIELD clinical MCQ.
+Generate ONE HIGH-YIELD MCQ.
 
 Mode: {mode}
 
-CONTENT:
+Content:
 {content}
 
 Rules:
-- Clinical vignette style preferred
+- Clinical vignette style
 - 4 options (A–D)
 - Only one correct answer
-- Very high difficulty
-- Explanation must cover all options
+- High difficulty
+- Explain all options
 
 Return ONLY JSON:
-
 {{
  "question": "...",
  "options": ["A) ...", "B) ...", "C) ...", "D) ..."],
@@ -117,24 +100,24 @@ Return ONLY JSON:
     return extract_json(response.choices[0].message.content)
 
 # ======================
-# REVIEWER (QUALITY FILTER)
+# REVIEW SYSTEM
 # ======================
 async def review_mcq(mcq):
     prompt = f"""
 You are a NEET PG question reviewer.
 
-Evaluate:
+Score this MCQ 1–10:
 
 Q: {mcq['question']}
 Options: {mcq['options']}
 Explanation: {mcq['explanation']}
 
-Score 1-10 based on:
+Check:
 - Clinical relevance
 - Difficulty
 - Distractors quality
 
-Return JSON:
+Return ONLY JSON:
 {{
  "score": 0,
  "approved": false
@@ -149,18 +132,28 @@ Return JSON:
     return extract_json(response.choices[0].message.content)
 
 # ======================
-# ADMIN APPROVAL
+# PDF TEXT EXTRACTION
+# ======================
+def extract_pdf_text(path):
+    doc = fitz.open(path)
+    text = ""
+    for page in doc:
+        text += page.get_text()
+    return text[:12000]
+
+# ======================
+# SEND TO ADMIN
 # ======================
 async def send_for_approval(context, mcq, source):
     qid = str(int(time.time()))
     pending_questions[qid] = mcq
 
     text = (
-        f"📋 NEW HIGH-YIELD MCQ\n\n"
+        f"📋 MCQ FOR APPROVAL\n\n"
         f"📚 Source: {source}\n\n"
         f"{mcq['question']}\n\n"
         + "\n".join(mcq["options"]) +
-        f"\n\n💡 {mcq['explanation']}"
+        f"\n\n💡 Explanation:\n{mcq['explanation']}"
     )
 
     keyboard = InlineKeyboardMarkup([
@@ -177,6 +170,31 @@ async def send_for_approval(context, mcq, source):
     )
 
 # ======================
+# AUTO MCQ (15 MIN)
+# ======================
+async def scheduled_job(context: ContextTypes.DEFAULT_TYPE):
+    topic = random.choice(TOPICS)
+
+    attempts = 0
+    mcq = None
+
+    while attempts < 2:
+        attempts += 1
+
+        mcq = await generate_mcq(topic, mode="auto")
+        if not mcq:
+            continue
+
+        review = await review_mcq(mcq)
+        if review and review.get("score", 0) >= 8.5:
+            break
+        else:
+            mcq = None
+
+    if mcq:
+        await send_for_approval(context, mcq, f"AUTO: {topic}")
+
+# ======================
 # PDF HANDLER
 # ======================
 async def handle_pdf(update, context):
@@ -185,32 +203,22 @@ async def handle_pdf(update, context):
 
     file = await update.message.document.get_file()
     path = f"/tmp/{update.message.document.file_name}"
+
     await file.download_to_drive(path)
 
-    await update.message.reply_text("📄 PDF received. Processing...")
+    text = extract_pdf_text(path)
 
-    text = extract_text(path)
-    images = extract_images(path)
+    await update.message.reply_text("📄 PDF received. Generating MCQ...")
 
-    # 1️⃣ Generate MCQ from TEXT
-    mcq_text = await generate_mcq(text, mode="text")
+    mcq = await generate_mcq(text, mode="PDF")
 
-    # 2️⃣ Generate MCQ from IMAGE if available
-    mcq_image = None
-    if images:
-        mcq_image = await generate_mcq("Image-based medical diagram", mode="image")
-
-    # REVIEW STEP
-    for mcq in [mcq_text, mcq_image]:
-        if not mcq:
-            continue
-
+    if mcq:
         review = await review_mcq(mcq)
 
         if review and review.get("score", 0) >= 8:
             await send_for_approval(context, mcq, "PDF")
         else:
-            await update.message.reply_text("⚠️ Low quality MCQ rejected automatically")
+            await update.message.reply_text("⚠️ Low quality MCQ rejected")
 
 # ======================
 # CALLBACK HANDLER
@@ -239,7 +247,7 @@ async def handle_callback(update, context):
             )
 
         pending_questions.pop(qid, None)
-        await query.edit_message_text("✅ Posted to channel")
+        await query.edit_message_text("✅ Posted")
 
     elif data.startswith("reject_"):
         qid = data.split("_")[1]
@@ -251,9 +259,9 @@ async def handle_callback(update, context):
 # ======================
 async def start(update, context):
     await update.message.reply_text(
-        "🚀 Bot running:\n\n"
-        "✔ PDF MCQ extraction\n"
-        "✔ Image MCQ support\n"
+        "🚀 Bot Running\n\n"
+        "✔ Auto MCQs (15 min)\n"
+        "✔ PDF MCQ generation\n"
         "✔ AI review system\n"
         "✔ Admin approval system"
     )
@@ -267,7 +275,15 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
+    # PDF handler
     app.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
+
+    # AUTO MCQ EVERY 15 MIN
+    app.job_queue.run_repeating(
+        scheduled_job,
+        interval=900,
+        first=10
+    )
 
     print("Bot running...")
     app.run_polling()
