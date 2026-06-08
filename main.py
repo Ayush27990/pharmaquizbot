@@ -317,4 +317,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
        topic = await generate_topic()
        mcq = await generate_mcq(topic)
        if mcq:
-           await send_for_approval(context, mcq, f"Regener
+          await send_for_approval(context, mcq, f"Regenerated: {topic}")
+
+         
