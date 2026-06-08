@@ -76,20 +76,17 @@ def extract_json(text):
 # ======================
 async def generate_topic():
    used = ", ".join(used_topics[-20:]) if used_topics else "none"
-   prompt = f"""You are a NEET PG / FMGE / USMLE medical expert.
-
-Suggest ONE specific high-yield topic for a biochemistry or pharmacology MCQ.
-
-Already used topics (avoid repeating): {used}
-
-Requirements:
-- Must be specific (not just "pharmacology")
-- Must be clinically relevant
-- Alternate between biochemistry and pharmacology
-- Focus on NEET PG high yield topics
-
-Return ONLY JSON:
-{{"topic": "Warfarin mechanism and vitamin K cycle"}}"""
+   prompt = (
+       "You are a NEET PG / FMGE / USMLE medical expert.\n\n"
+       "Suggest ONE specific high-yield topic for a biochemistry or pharmacology MCQ.\n\n"
+       "Already used topics (avoid repeating): " + used + "\n\n"
+       "Requirements:\n"
+       "- Must be specific\n"
+       "- Must be clinically relevant\n"
+       "- Alternate between biochemistry and pharmacology\n"
+       "- Focus on NEET PG high yield topics\n\n"
+       'Return ONLY JSON: {"topic": "Warfarin mechanism and vitamin K cycle"}'
+   )
    try:
        response = client.chat.completions.create(
            model="llama-3.3-70b-versatile",
@@ -103,32 +100,28 @@ Return ONLY JSON:
            used_topics.pop(0)
        return topic
    except Exception as e:
-       logger.error(f"Topic generation error: {e}")
+       logger.error("Topic generation error: " + str(e))
        return "Biochemistry high yield topic"
 
 # ======================
 # GENERATE MCQ
 # ======================
 async def generate_mcq(content):
-   prompt = f"""You are a NEET PG / USMLE / FMGE expert examiner.
-
-Generate ONE high-yield clinical MCQ based on: {content}
-
-Rules:
-- Clinical vignette style (patient scenario)
-- 4 options, one definitively correct
-- No ambiguous or trick questions
-- Explanation must cite mechanism clearly
-- Explain why each wrong option is incorrect
-- NEET PG / FMGE exam standard
-
-Return ONLY this JSON:
-{{
- "question": "A patient presents with...",
- "options": ["A) ...", "B) ...", "C) ...", "D) ..."],
- "answer_index": 0,
- "explanation": "Correct: A because... B is wrong because... C is wrong because... D is wrong because..."
-}}"""
+   prompt = (
+       "You are a NEET PG / USMLE / FMGE expert examiner.\n\n"
+       "Generate ONE high-yield clinical MCQ based on: " + content + "\n\n"
+       "Rules:\n"
+       "- Clinical vignette style with patient scenario\n"
+       "- 4 options, one definitively correct\n"
+       "- No ambiguous or trick questions\n"
+       "- Explanation must cite mechanism clearly\n"
+       "- Explain why each wrong option is incorrect\n\n"
+       "Return ONLY this JSON:\n"
+       '{"question": "A patient presents with...", '
+       '"options": ["A) ...", "B) ...", "C) ...", "D) ..."], '
+       '"answer_index": 0, '
+       '"explanation": "Correct: A because... B is wrong because..."}'
+   )
    try:
        response = client.chat.completions.create(
            model="llama-3.3-70b-versatile",
@@ -137,37 +130,24 @@ Return ONLY this JSON:
        )
        return extract_json(response.choices[0].message.content)
    except Exception as e:
-       logger.error(f"MCQ generation error: {e}")
+       logger.error("MCQ generation error: " + str(e))
        return None
 
 # ======================
 # VALIDATE MCQ
 # ======================
 async def validate_mcq(mcq):
-   prompt = f"""You are a medical education quality reviewer.
-
-Review this MCQ for accuracy and quality:
-
-Question: {mcq['question']}
-Options: {mcq['options']}
-Answer index: {mcq['answer_index']}
-Explanation: {mcq['explanation']}
-
-Check:
-1. Is the correct answer medically accurate?
-2. Is the explanation accurate and detailed?
-3. Are wrong options clearly incorrect?
-4. Is it high yield for NEET PG / FMGE?
-5. Is the clinical vignette realistic?
-
-Return ONLY JSON:
-{{
- "score": 8,
- "is_accurate": true,
- "feedback": "Question is accurate and high yield"
-}}
-
-Score 1-10. Be strict."""
+   prompt = (
+       "You are a medical education quality reviewer.\n\n"
+       "Review this MCQ:\n"
+       "Question: " + mcq["question"] + "\n"
+       "Options: " + str(mcq["options"]) + "\n"
+       "Answer index: " + str(mcq["answer_index"]) + "\n"
+       "Explanation: " + mcq["explanation"] + "\n\n"
+       "Check accuracy, explanation quality, and NEET PG relevance.\n\n"
+       "Return ONLY JSON:\n"
+       '{"score": 8, "is_accurate": true, "feedback": "Good question"}'
+   )
    try:
        response = client.chat.completions.create(
            model="llama-3.3-70b-versatile",
@@ -176,58 +156,56 @@ Score 1-10. Be strict."""
        )
        return extract_json(response.choices[0].message.content)
    except Exception as e:
-       logger.error(f"Validation error: {e}")
+       logger.error("Validation error: " + str(e))
        return None
 
 # ======================
 # SEND FOR APPROVAL
 # ======================
-async def send_for_approval(context, mcq, source):
-   qid = str(int(time.time()))
-   pending_questions[qid] = {"mcq": mcq, "source": source}
-
-   correct_option = mcq["options"][mcq["answer_index"]]
-
-   text = (
-       f"📋 *NEW MCQ FOR APPROVAL*\n\n"
-       f"📚 Source: {source}\n\n"
-       f"*{mcq['question']}*\n\n"
-       + "\n".join(mcq["options"]) +
-       f"\n\n✅ *Correct: {correct_option}*\n\n"
-       f"💡 *Explanation:*\n{mcq['explanation']}"
-   )
-
-   keyboard = InlineKeyboardMarkup([
-       [
-           InlineKeyboardButton("✅ Approve & Post", callback_data=f"approve_{qid}"),
-           InlineKeyboardButton("❌ Reject", callback_data=f"reject_{qid}")
-       ],
-       [
-           InlineKeyboardButton("🔄 Regenerate", callback_data=f"regen_{qid}")
-       ]
-   ])
-
-   await context.bot.send_message(
-       chat_id=ADMIN_ID,
-       text=text,
-       parse_mode="Markdown",
-       reply_markup=keyboard
-   )
+async def send_for_approval(bot, mcq, source):
+   try:
+       qid = str(int(time.time()))
+       pending_questions[qid] = {"mcq": mcq, "source": source}
+       correct_option = mcq["options"][mcq["answer_index"]]
+       text = (
+           "📋 NEW MCQ FOR APPROVAL\n\n"
+           "📚 Source: " + source + "\n\n"
+           + mcq["question"] + "\n\n"
+           + "\n".join(mcq["options"])
+           + "\n\n✅ Correct: " + correct_option
+           + "\n\n💡 Explanation:\n" + mcq["explanation"]
+       )
+       keyboard = InlineKeyboardMarkup([
+           [
+               InlineKeyboardButton("✅ Approve & Post", callback_data="approve_" + qid),
+               InlineKeyboardButton("❌ Reject", callback_data="reject_" + qid)
+           ],
+           [
+               InlineKeyboardButton("🔄 Regenerate", callback_data="regen_" + qid)
+           ]
+       ])
+       await bot.send_message(
+           chat_id=ADMIN_ID,
+           text=text,
+           reply_markup=keyboard
+       )
+       logger.info("MCQ sent for approval: " + source)
+   except Exception as e:
+       logger.error("Send for approval error: " + str(e))
 
 # ======================
 # POST TO CHANNEL
 # ======================
-async def post_to_channel(context, mcq):
+async def post_to_channel(bot, mcq):
    try:
        text_msg = (
-           f"📚 *DAILY MCQ*\n\n"
-           f"*{mcq['question']}*\n\n"
+           "📚 DAILY MCQ\n\n"
+           + mcq["question"] + "\n\n"
            + "\n".join(mcq["options"])
        )
-       await context.bot.send_message(
+       await bot.send_message(
            chat_id=CHANNEL_ID,
-           text=text_msg,
-           parse_mode="Markdown"
+           text=text_msg
        )
        await asyncio.sleep(2)
 
@@ -238,7 +216,7 @@ async def post_to_channel(context, mcq):
            else:
                clean_options.append(opt)
 
-       await context.bot.send_poll(
+       await bot.send_poll(
            chat_id=CHANNEL_ID,
            question=mcq["question"][:300],
            options=clean_options,
@@ -249,23 +227,24 @@ async def post_to_channel(context, mcq):
        await asyncio.sleep(2)
 
        explanation_escaped = escape_md(mcq["explanation"])
-       spoiler = f"💡 *Explanation:*\n\n||{explanation_escaped}||"
-       await context.bot.send_message(
+       spoiler = "💡 Explanation:\n\n||" + explanation_escaped + "||"
+       await bot.send_message(
            chat_id=CHANNEL_ID,
            text=spoiler,
            parse_mode="MarkdownV2"
        )
        logger.info("Successfully posted to channel")
    except Exception as e:
-       logger.error(f"Post to channel error: {e}")
+       logger.error("Post to channel error: " + str(e))
 
 # ======================
 # SCHEDULED JOB
 # ======================
 async def scheduled_job(context: ContextTypes.DEFAULT_TYPE):
    try:
+       logger.info("Running scheduled job...")
        topic = await generate_topic()
-       logger.info(f"AI generated topic: {topic}")
+       logger.info("Generated topic: " + topic)
 
        mcq = await generate_mcq(topic)
        if not mcq:
@@ -274,18 +253,18 @@ async def scheduled_job(context: ContextTypes.DEFAULT_TYPE):
 
        review = await validate_mcq(mcq)
        score = review.get("score", 0) if review else 0
-       logger.info(f"MCQ score: {score}")
+       logger.info("MCQ score: " + str(score))
 
        if score >= 7:
-           await send_for_approval(context, mcq, f"Auto: {topic}")
+           await send_for_approval(context.bot, mcq, "Auto: " + topic)
        else:
-           logger.info(f"Low score ({score}), regenerating...")
+           logger.info("Low score, regenerating...")
            topic2 = await generate_topic()
            mcq2 = await generate_mcq(topic2)
            if mcq2:
-               await send_for_approval(context, mcq2, f"Auto retry: {topic2}")
+               await send_for_approval(context.bot, mcq2, "Auto retry: " + topic2)
    except Exception as e:
-       logger.error(f"Scheduled job error: {e}")
+       logger.error("Scheduled job error: " + str(e))
 
 # ======================
 # CALLBACK HANDLER
@@ -299,7 +278,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
        qid = data.replace("approve_", "")
        item = pending_questions.get(qid)
        if item:
-           await post_to_channel(context, item["mcq"])
+           await post_to_channel(context.bot, item["mcq"])
            pending_questions.pop(qid, None)
            await query.edit_message_text("✅ Posted to channel!")
        else:
@@ -313,10 +292,110 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
    elif data.startswith("regen_"):
        qid = data.replace("regen_", "")
        pending_questions.pop(qid, None)
-       await query.edit_message_text("🔄 Regenerating new question...")
+       await query.edit_message_text("🔄 Regenerating...")
        topic = await generate_topic()
        mcq = await generate_mcq(topic)
        if mcq:
-          await send_for_approval(context, mcq, f"Regenerated: {topic}")
+           await send_for_approval(context.bot, mcq, "Regenerated: " + topic)
+       else:
+           await context.bot.send_message(
+               chat_id=ADMIN_ID,
+               text="❌ Failed to regenerate. Try /postnow"
+           )
 
-         
+# ======================
+# PDF HANDLER
+# ======================
+async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+   if update.effective_user.id != ADMIN_ID:
+       return
+   try:
+       await update.message.reply_text("📄 PDF received. Extracting text...")
+       file = await update.message.document.get_file()
+       file_bytes = await file.download_as_bytearray()
+       pdf_reader = PyPDF2.PdfReader(io.BytesIO(bytes(file_bytes)))
+       text = ""
+       for page in pdf_reader.pages[:10]:
+           extracted = page.extract_text()
+           if extracted:
+               text += extracted + "\n"
+       if not text.strip():
+           await update.message.reply_text("❌ Could not extract text.")
+           return
+       text = text[:4000]
+       await update.message.reply_text("⏳ Generating MCQ from PDF...")
+       mcq = await generate_mcq(text)
+       if not mcq:
+           await update.message.reply_text("❌ Failed to generate MCQ.")
+           return
+       review = await validate_mcq(mcq)
+       score = review.get("score", 0) if review else 0
+       if score >= 7:
+           await send_for_approval(context.bot, mcq, "PDF Upload")
+       else:
+           await update.message.reply_text("⚠️ Low quality. Retrying...")
+           mcq2 = await generate_mcq(text)
+           if mcq2:
+               await send_for_approval(context.bot, mcq2, "PDF Upload retry")
+   except Exception as e:
+       logger.error("PDF error: " + str(e))
+       await update.message.reply_text("❌ PDF processing failed.")
+
+# ======================
+# COMMANDS
+# ======================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+   if update.effective_user.id != ADMIN_ID:
+       return
+   await update.message.reply_text(
+       "✅ Pharma Quiz Bot Running!\n\n"
+       "Features:\n"
+       "🤖 AI generates topics automatically\n"
+       "✅ AI validates quality\n"
+       "👨 You approve before posting\n"
+       "🔄 Regenerate if not satisfied\n"
+       "📄 Send PDF to generate MCQ\n\n"
+       "Commands:\n"
+       "/postnow - Generate immediately\n"
+       "/status - Check bot status"
+   )
+
+async def post_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+   if update.effective_user.id != ADMIN_ID:
+       return
+   await update.message.reply_text("⏳ Generating MCQ... please wait 30-60 seconds")
+   await scheduled_job(context)
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+   if update.effective_user.id != ADMIN_ID:
+       return
+   await update.message.reply_text(
+       "✅ Bot is running\n"
+       "📊 Pending approvals: " + str(len(pending_questions)) + "\n"
+       "📚 Topics used: " + str(len(used_topics))
+   )
+
+# ======================
+# MAIN
+# ======================
+def main():
+   logger.info("Starting Pharma Quiz Bot...")
+   app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+   app.add_handler(CommandHandler("start", start))
+   app.add_handler(CommandHandler("postnow", post_now))
+   app.add_handler(CommandHandler("status", status))
+   app.add_handler(CallbackQueryHandler(handle_callback))
+   app.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
+
+   app.job_queue.run_repeating(
+       scheduled_job,
+       interval=INTERVAL,
+       first=10
+   )
+
+   logger.info("Bot started! Interval: " + str(INTERVAL // 60) + " minutes")
+   app.run_polling(drop_pending_updates=True)
+
+if __name__ == "__main__":
+   main()
