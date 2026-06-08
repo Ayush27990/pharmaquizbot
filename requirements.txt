@@ -1,5 +1,5 @@
-python-telegram-bot==20.7
-groq
-PyPDF2
-flask
-apscheduler
+python-telegram-bot[job-queue]==20.7
+groq>=0.4.0
+PyPDF2>=3.0.0
+flask>=3.0.0
+apscheduler>=3.10.0
