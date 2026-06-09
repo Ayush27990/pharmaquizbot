@@ -36,7 +36,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 ADMIN_ID = 723919716
-INTERVAL = 3600  # 1 hour
+INTERVAL = 900  
 
 if not TELEGRAM_TOKEN:
     raise ValueError("TELEGRAM_TOKEN missing")
