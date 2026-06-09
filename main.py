@@ -6,6 +6,7 @@ import logging
 import asyncio
 import io
 import base64
+import random
 
 import PyPDF2
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -33,9 +34,10 @@ logger = logging.getLogger(__name__)
 # ======================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_API_KEY_2 = os.getenv("GROQ_API_KEY_2")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 ADMIN_ID = 723919716
-INTERVAL = 900
+INTERVAL = 1800  # 30 minutes
 
 if not TELEGRAM_TOKEN:
     raise ValueError("TELEGRAM_TOKEN missing")
@@ -44,7 +46,10 @@ if not GROQ_API_KEY:
 if not CHANNEL_ID:
     raise ValueError("CHANNEL_ID missing")
 
-client = Groq(api_key=GROQ_API_KEY)
+GROQ_KEYS = [k for k in [GROQ_API_KEY, GROQ_API_KEY_2] if k]
+current_key_index = 0
+client = Groq(api_key=GROQ_KEYS[0])
+
 pending_questions = {}
 used_topics = []
 
@@ -108,6 +113,30 @@ GOODMAN_TOPICS = [
 ]
 
 # ======================
+# GROQ KEY ROTATION
+# ======================
+def rotate_groq_key():
+    global current_key_index, client
+    if len(GROQ_KEYS) > 1:
+        current_key_index = (current_key_index + 1) % len(GROQ_KEYS)
+        client = Groq(api_key=GROQ_KEYS[current_key_index])
+        logger.info(f"Rotated to Groq key index {current_key_index}")
+
+async def groq_call(**kwargs):
+    for attempt in range(len(GROQ_KEYS) * 2):
+        try:
+            return client.chat.completions.create(**kwargs)
+        except Exception as e:
+            if "rate_limit" in str(e).lower() or "429" in str(e):
+                logger.warning(f"Rate limit hit attempt {attempt}, waiting 15s then rotating...")
+                await asyncio.sleep(15)
+                rotate_groq_key()
+            else:
+                raise e
+    logger.error("All Groq keys exhausted")
+    return None
+
+# ======================
 # HELPERS
 # ======================
 def escape_md(text):
@@ -136,12 +165,10 @@ def extract_json(text):
 # ======================
 async def generate_topic(book=None):
     if book == "harper":
-        import random
         topic = random.choice(HARPER_TOPICS)
         used_topics.append(topic)
         return topic
     elif book == "goodman":
-        import random
         topic = random.choice(GOODMAN_TOPICS)
         used_topics.append(topic)
         return topic
@@ -159,11 +186,13 @@ async def generate_topic(book=None):
         'Return ONLY JSON: {"topic": "Warfarin mechanism and vitamin K cycle"}'
     )
     try:
-        response = client.chat.completions.create(
+        response = await groq_call(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.9
         )
+        if not response:
+            return "Biochemistry high yield topic"
         result = extract_json(response.choices[0].message.content)
         topic = result.get("topic") if result else "Pharmacology high yield topic"
         used_topics.append(topic)
@@ -180,13 +209,13 @@ async def generate_topic(book=None):
 async def generate_mcq(content, book_context=None):
     if book_context == "harper":
         source_context = (
-            "Based on Harper's Illustrated Biochemistry 33rd Edition concepts. "
-            "Reference Harper's chapter topics, enzyme names, and clinical correlations exactly as presented in that textbook."
+            "Based on Harper's Illustrated Biochemistry 33rd Edition. "
+            "Reference Harper's chapter topics, enzyme names, and clinical correlations exactly as in that textbook."
         )
     elif book_context == "goodman":
         source_context = (
             "Based on Goodman & Gilman's Pharmacological Basis of Therapeutics. "
-            "Reference drug mechanisms, receptor pharmacology, and clinical applications as presented in Goodman & Gilman."
+            "Reference drug mechanisms, receptor pharmacology, and clinical applications as in Goodman & Gilman."
         )
     else:
         source_context = "Based on standard NEET PG / USMLE medical curriculum."
@@ -208,11 +237,13 @@ async def generate_mcq(content, book_context=None):
         '"explanation": "Correct: A because... B is wrong because..."}'
     )
     try:
-        response = client.chat.completions.create(
+        response = await groq_call(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3
         )
+        if not response:
+            return None
         return extract_json(response.choices[0].message.content)
     except Exception as e:
         logger.error("MCQ generation error: " + str(e))
@@ -222,11 +253,9 @@ async def generate_mcq(content, book_context=None):
 # GENERATE MCQ FROM IMAGE
 # ======================
 async def generate_mcq_from_image(image_bytes, mime_type="image/jpeg"):
-    """Use Groq vision to extract text from image then generate MCQ"""
     try:
         b64 = base64.b64encode(image_bytes).decode("utf-8")
-        # Step 1: Extract text from image using vision
-        vision_response = client.chat.completions.create(
+        vision_response = await groq_call(
             model="meta-llama/llama-4-scout-17b-16e-instruct",
             messages=[
                 {
@@ -234,56 +263,29 @@ async def generate_mcq_from_image(image_bytes, mime_type="image/jpeg"):
                     "content": [
                         {
                             "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{mime_type};base64,{b64}"
-                            }
+                            "image_url": {"url": f"data:{mime_type};base64,{b64}"}
                         },
                         {
                             "type": "text",
-                            "text": "Extract all medical/biochemistry/pharmacology text from this image. Return the raw text content only."
+                            "text": "Extract all medical/biochemistry/pharmacology text from this image. Return raw text only."
                         }
                     ]
                 }
             ],
             temperature=0.1
         )
+        if not vision_response:
+            return None, "Vision model unavailable"
         extracted_text = vision_response.choices[0].message.content
         if not extracted_text or len(extracted_text.strip()) < 20:
             return None, "Could not extract text from image"
-
         extracted_text = extracted_text[:4000]
-        # Step 2: Generate MCQ from extracted text
+        await asyncio.sleep(15)
         mcq = await generate_mcq(extracted_text)
         return mcq, extracted_text[:200]
     except Exception as e:
         logger.error("Image MCQ error: " + str(e))
         return None, str(e)
-
-# ======================
-# VALIDATE MCQ
-# ======================
-async def validate_mcq(mcq):
-    prompt = (
-        "You are a medical education quality reviewer.\n\n"
-        "Review this MCQ:\n"
-        "Question: " + mcq["question"] + "\n"
-        "Options: " + str(mcq["options"]) + "\n"
-        "Answer index: " + str(mcq["answer_index"]) + "\n"
-        "Explanation: " + mcq["explanation"] + "\n\n"
-        "Check accuracy, explanation quality, and NEET PG relevance.\n\n"
-        "Return ONLY JSON:\n"
-        '{"score": 8, "is_accurate": true, "feedback": "Good question"}'
-    )
-    try:
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1
-        )
-        return extract_json(response.choices[0].message.content)
-    except Exception as e:
-        logger.error("Validation error: " + str(e))
-        return None
 
 # ======================
 # SEND FOR APPROVAL
@@ -329,10 +331,7 @@ async def post_to_channel(bot, mcq):
             + mcq["question"] + "\n\n"
             + "\n".join(mcq["options"])
         )
-        await bot.send_message(
-            chat_id=CHANNEL_ID,
-            text=text_msg
-        )
+        await bot.send_message(chat_id=CHANNEL_ID, text=text_msg)
         await asyncio.sleep(2)
 
         clean_options = []
@@ -371,24 +370,14 @@ async def scheduled_job(context: ContextTypes.DEFAULT_TYPE):
         logger.info("Running scheduled job...")
         topic = await generate_topic()
         logger.info("Generated topic: " + topic)
+        await asyncio.sleep(15)  # wait before MCQ call
 
         mcq = await generate_mcq(topic)
         if not mcq:
             logger.error("Failed to generate MCQ")
             return
 
-        review = await validate_mcq(mcq)
-        score = review.get("score", 0) if review else 0
-        logger.info("MCQ score: " + str(score))
-
-        if score >= 7:
-            await send_for_approval(context.bot, mcq, "Auto: " + topic)
-        else:
-            logger.info("Low score, regenerating...")
-            topic2 = await generate_topic()
-            mcq2 = await generate_mcq(topic2)
-            if mcq2:
-                await send_for_approval(context.bot, mcq2, "Auto retry: " + topic2)
+        await send_for_approval(context.bot, mcq, "Auto: " + topic)
     except Exception as e:
         logger.error("Scheduled job error: " + str(e))
 
@@ -420,6 +409,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pending_questions.pop(qid, None)
         await query.edit_message_text("🔄 Regenerating...")
         topic = await generate_topic()
+        await asyncio.sleep(15)
         mcq = await generate_mcq(topic)
         if mcq:
             await send_for_approval(context.bot, mcq, "Regenerated: " + topic)
@@ -436,27 +426,15 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
     try:
-        await update.message.reply_text("🖼️ Image received. Extracting text and generating MCQ...")
-        photo = update.message.photo[-1]  # highest resolution
+        await update.message.reply_text("🖼️ Image received. Extracting and generating MCQ...")
+        photo = update.message.photo[-1]
         file = await photo.get_file()
         image_bytes = await file.download_as_bytearray()
-
         mcq, preview = await generate_mcq_from_image(bytes(image_bytes))
         if not mcq:
-            await update.message.reply_text(f"❌ Failed to generate MCQ from image.\nReason: {preview}")
+            await update.message.reply_text(f"❌ Failed.\nReason: {preview}")
             return
-
-        review = await validate_mcq(mcq)
-        score = review.get("score", 0) if review else 0
-        if score >= 7:
-            await send_for_approval(context.bot, mcq, "Image Upload")
-        else:
-            await update.message.reply_text("⚠️ Low quality score. Retrying...")
-            mcq2, _ = await generate_mcq_from_image(bytes(image_bytes))
-            if mcq2:
-                await send_for_approval(context.bot, mcq2, "Image Upload retry")
-            else:
-                await update.message.reply_text("❌ Could not generate quality MCQ from image.")
+        await send_for_approval(context.bot, mcq, "Image Upload")
     except Exception as e:
         logger.error("Image handler error: " + str(e))
         await update.message.reply_text("❌ Image processing failed: " + str(e))
@@ -482,19 +460,12 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         text = text[:4000]
         await update.message.reply_text("⏳ Generating MCQ from PDF...")
+        await asyncio.sleep(15)
         mcq = await generate_mcq(text)
         if not mcq:
             await update.message.reply_text("❌ Failed to generate MCQ.")
             return
-        review = await validate_mcq(mcq)
-        score = review.get("score", 0) if review else 0
-        if score >= 7:
-            await send_for_approval(context.bot, mcq, "PDF Upload")
-        else:
-            await update.message.reply_text("⚠️ Low quality. Retrying...")
-            mcq2 = await generate_mcq(text)
-            if mcq2:
-                await send_for_approval(context.bot, mcq2, "PDF Upload retry")
+        await send_for_approval(context.bot, mcq, "PDF Upload")
     except Exception as e:
         logger.error("PDF error: " + str(e))
         await update.message.reply_text("❌ PDF processing failed.")
@@ -526,20 +497,12 @@ async def harper_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📖 Generating MCQ from Harper's Biochemistry 33rd Edition...")
     topic = await generate_topic(book="harper")
     await update.message.reply_text(f"🧬 Topic: {topic}")
+    await asyncio.sleep(15)
     mcq = await generate_mcq(topic, book_context="harper")
     if not mcq:
         await update.message.reply_text("❌ Failed to generate MCQ.")
         return
-    review = await validate_mcq(mcq)
-    score = review.get("score", 0) if review else 0
-    if score >= 6:
-        await send_for_approval(context.bot, mcq, f"Harper 33e: {topic}")
-    else:
-        await update.message.reply_text(f"⚠️ Score {score}/10. Retrying with new topic...")
-        topic2 = await generate_topic(book="harper")
-        mcq2 = await generate_mcq(topic2, book_context="harper")
-        if mcq2:
-            await send_for_approval(context.bot, mcq2, f"Harper 33e: {topic2}")
+    await send_for_approval(context.bot, mcq, f"Harper 33e: {topic}")
 
 async def goodman_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -547,20 +510,12 @@ async def goodman_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("💊 Generating MCQ from Goodman & Gilman...")
     topic = await generate_topic(book="goodman")
     await update.message.reply_text(f"💉 Topic: {topic}")
+    await asyncio.sleep(15)
     mcq = await generate_mcq(topic, book_context="goodman")
     if not mcq:
         await update.message.reply_text("❌ Failed to generate MCQ.")
         return
-    review = await validate_mcq(mcq)
-    score = review.get("score", 0) if review else 0
-    if score >= 6:
-        await send_for_approval(context.bot, mcq, f"Goodman & Gilman: {topic}")
-    else:
-        await update.message.reply_text(f"⚠️ Score {score}/10. Retrying with new topic...")
-        topic2 = await generate_topic(book="goodman")
-        mcq2 = await generate_mcq(topic2, book_context="goodman")
-        if mcq2:
-            await send_for_approval(context.bot, mcq2, f"Goodman & Gilman: {topic2}")
+    await send_for_approval(context.bot, mcq, f"Goodman & Gilman: {topic}")
 
 async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -569,7 +524,8 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Your ID: {user_id}\n"
         f"Admin ID: {ADMIN_ID}\n"
         f"Match: {'✅' if user_id == ADMIN_ID else '❌'}\n"
-        f"Pending: {len(pending_questions)}\n"
+        f"Active Groq key: #{current_key_index + 1} of {len(GROQ_KEYS)}\n"
+        f"Pending approvals: {len(pending_questions)}\n"
         f"Topics used: {len(used_topics)}"
     )
 
@@ -584,6 +540,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "✅ Bot is running\n"
+        f"🔑 Groq key: #{current_key_index + 1} of {len(GROQ_KEYS)}\n"
         "📊 Pending approvals: " + str(len(pending_questions)) + "\n"
         "📚 Topics used: " + str(len(used_topics))
     )
@@ -608,7 +565,7 @@ def main():
     app.job_queue.run_repeating(
         scheduled_job,
         interval=INTERVAL,
-        first=10
+        first=30
     )
 
     logger.info("Bot started! Interval: " + str(INTERVAL // 60) + " minutes")
