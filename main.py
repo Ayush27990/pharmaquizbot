@@ -85,7 +85,7 @@ GOODMAN_TOPICS = [
     "Beta blocker pharmacology and selectivity",
     "ACE inhibitors vs ARBs mechanisms",
     "Diuretics loop vs thiazide vs potassium sparing",
-    "Antiepileptic drugs mechanisms",
+    "Antiepileptic drugs",
     "Benzodiazepine vs barbiturate GABA mechanism",
     "Opioid receptors and analgesic ladder",
     "NSAIDs COX selectivity and side effects",
