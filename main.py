@@ -9,6 +9,10 @@ import base64
 import random
 
 import PyPDF2
+import httpx
+from bs4 import BeautifulSoup
+from youtube_transcript_api import YouTubeTranscriptApi
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -66,8 +70,8 @@ def save_json(filename, data):
         pass
 
 used_topics = load_json("used_topics.json", [])
-used_questions = load_json("used_questions.json", [])  # stores question hashes
-last_subject = load_json("last_subject.json", {"subject": "pharma"})  # tracks alternation
+used_questions = load_json("used_questions.json", [])
+last_subject = load_json("last_subject.json", {"subject": "pharma"})
 
 # ======================
 # TOPIC POOLS
@@ -182,8 +186,19 @@ def extract_json(text):
         logger.error(f"JSON parse error: {e}")
         return None
 
+def extract_json_list(text):
+    try:
+        match = re.search(r"\[.*\]", text, re.DOTALL)
+        if match:
+            result = json.loads(match.group())
+            if isinstance(result, list):
+                return result
+        return []
+    except Exception as e:
+        logger.error("JSON list parse error: " + str(e))
+        return []
+
 def make_question_hash(question_text):
-    """Create a short hash to track used questions"""
     return question_text[:80].strip().lower()
 
 def is_question_used(question_text):
@@ -212,10 +227,48 @@ async def safe_groq_call(**kwargs):
     return None
 
 # ======================
+# URL / YOUTUBE HELPERS
+# ======================
+def extract_youtube_id(url):
+    patterns = [
+        r"youtube\.com/watch\?v=([^&]+)",
+        r"youtu\.be/([^?]+)",
+        r"youtube\.com/shorts/([^?]+)"
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
+async def get_youtube_transcript(video_id):
+    try:
+        transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
+        text = " ".join([t["text"] for t in transcript_list])
+        return text[:4000]
+    except Exception as e:
+        logger.error("YouTube transcript error: " + str(e))
+        return None
+
+async def fetch_url_content(url):
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        async with httpx.AsyncClient(timeout=15) as client_http:
+            response = await client_http.get(url, headers=headers, follow_redirects=True)
+            soup = BeautifulSoup(response.text, "html.parser")
+            for tag in soup(["script", "style", "nav", "footer", "header"]):
+                tag.decompose()
+            text = soup.get_text(separator="\n", strip=True)
+            text = re.sub(r"\n{3,}", "\n\n", text)
+            return text[:4000]
+    except Exception as e:
+        logger.error("URL fetch error: " + str(e))
+        return None
+
+# ======================
 # ALTERNATING SUBJECT
 # ======================
 def get_next_subject():
-    """Alternates between biochem and pharma each call"""
     current = last_subject.get("subject", "pharma")
     next_subject = "harper" if current == "goodman" else "goodman"
     last_subject["subject"] = next_subject
@@ -313,7 +366,6 @@ async def generate_mcq(content, book_context=None, retry=0):
         if not mcq:
             return None
 
-        # Strip any A) or A. prefixes the model adds anyway
         cleaned_options = []
         for opt in mcq.get("options", []):
             opt = opt.strip()
@@ -322,7 +374,6 @@ async def generate_mcq(content, book_context=None, retry=0):
             cleaned_options.append(opt)
         mcq["options"] = cleaned_options
 
-        # Check for duplicate question, retry once if duplicate
         if is_question_used(mcq.get("question", "")):
             logger.warning("Duplicate question detected, retrying...")
             if retry < 2:
@@ -336,6 +387,47 @@ async def generate_mcq(content, book_context=None, retry=0):
 
     except Exception as e:
         logger.error("MCQ generation error: " + str(e))
+        return None
+
+# ======================
+# REPHRASE FORWARDED MCQ
+# ======================
+async def rephrase_forwarded_mcq(text):
+    prompt = (
+        "You are a medical MCQ expert.\n\n"
+        "Here is a forwarded MCQ:\n\n" + text + "\n\n"
+        "Task:\n"
+        "1. Slightly rephrase the question stem (keep same meaning)\n"
+        "2. Keep the same options\n"
+        "3. Identify the correct answer\n"
+        "4. Add a detailed explanation\n\n"
+        "Return ONLY this JSON:\n"
+        '{"question": "rephrased question...", '
+        '"options": ["option1", "option2", "option3", "option4"], '
+        '"answer_index": 0, '
+        '"explanation": "Correct: A because... B is wrong because..."}'
+        "\n\nIMPORTANT: options must be plain text only, NO A) or A. prefix inside the options array."
+    )
+    try:
+        response = await safe_groq_call(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3
+        )
+        if not response:
+            return None
+        mcq = extract_json(response.choices[0].message.content)
+        if mcq:
+            cleaned_options = []
+            for opt in mcq.get("options", []):
+                opt = opt.strip()
+                if len(opt) > 2 and opt[1] in (")", ".") and opt[0].isalpha():
+                    opt = opt[2:].strip()
+                cleaned_options.append(opt)
+            mcq["options"] = cleaned_options
+        return mcq
+    except Exception as e:
+        logger.error("Rephrase error: " + str(e))
         return None
 
 # ======================
@@ -385,7 +477,6 @@ async def send_for_approval(bot, mcq, source):
         pending_questions[qid] = {"mcq": mcq, "source": source}
         correct_option = mcq["options"][mcq["answer_index"]]
 
-        # Preview uses A. B. C. D. format
         options_preview = []
         for i, opt in enumerate(mcq["options"]):
             letter = chr(65 + i)
@@ -421,11 +512,10 @@ async def send_for_approval(bot, mcq, source):
 # POST TO CHANNEL
 # ======================
 async def post_to_channel(bot, mcq):
-    # --- Message 1: Question + options (A. B. C. D. format) ---
     try:
         options_text = []
         for i, opt in enumerate(mcq["options"]):
-            letter = chr(65 + i)  # A, B, C, D
+            letter = chr(65 + i)
             options_text.append(f"{letter}. {opt}")
 
         text_msg = mcq["question"] + "\n\n" + "\n".join(options_text)
@@ -434,10 +524,8 @@ async def post_to_channel(bot, mcq):
     except Exception as e:
         logger.error("Failed to send question text: " + str(e))
 
-    # --- Message 2: Poll (options are plain text, no prefix) ---
     try:
         clean_options = [opt[:100] for opt in mcq["options"]]
-
         await bot.send_poll(
             chat_id=CHANNEL_ID,
             question=mcq["question"][:300],
@@ -450,7 +538,6 @@ async def post_to_channel(bot, mcq):
     except Exception as e:
         logger.error("Failed to send poll: " + str(e))
 
-    # --- Message 3: Explanation as spoiler ---
     try:
         explanation_escaped = escape_md(mcq["explanation"])
         spoiler = "💡 *Explanation:*\n\n||" + explanation_escaped + "||"
@@ -470,7 +557,7 @@ async def post_to_channel(bot, mcq):
             logger.error("Fallback explanation failed: " + str(e2))
 
 # ======================
-# SCHEDULED JOB (alternates biochem / pharma)
+# SCHEDULED JOB
 # ======================
 async def scheduled_job(context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -519,7 +606,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         old_item = pending_questions.pop(qid, None)
         await query.edit_message_text("🔄 Regenerating...")
 
-        # Keep same subject when regenerating
         source = old_item["source"] if old_item else ""
         if "Harper" in source:
             book = "harper"
@@ -541,6 +627,32 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
 # ======================
+# FORWARDED POLL HANDLER
+# ======================
+async def handle_forwarded_poll(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    try:
+        poll = update.message.poll
+        if not poll:
+            return
+        question = poll.question
+        options = [opt.text for opt in poll.options]
+        text = (
+            question + "\n\n"
+            + "\n".join([chr(65 + i) + ") " + opt for i, opt in enumerate(options)])
+        )
+        await update.message.reply_text("📊 Forwarded poll detected! Processing...")
+        mcq = await rephrase_forwarded_mcq(text)
+        if not mcq:
+            await update.message.reply_text("❌ Could not process poll.")
+            return
+        await send_for_approval(context.bot, mcq, "Forwarded Poll")
+    except Exception as e:
+        logger.error("Forwarded poll error: " + str(e))
+        await update.message.reply_text("❌ Failed to process poll.")
+
+# ======================
 # IMAGE HANDLER
 # ======================
 async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -548,10 +660,14 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         await update.message.reply_text("🖼️ Image received. Generating MCQ...")
-        photo = update.message.photo[-1]
-        file = await photo.get_file()
-        image_bytes = await file.download_as_bytearray()
-        mcq, preview = await generate_mcq_from_image(bytes(image_bytes))
+        if update.message.photo:
+            file = await update.message.photo[-1].get_file()
+        elif update.message.document:
+            file = await update.message.document.get_file()
+        else:
+            return
+        image_bytes = bytes(await file.download_as_bytearray())
+        mcq, preview = await generate_mcq_from_image(image_bytes)
         if not mcq:
             await update.message.reply_text(f"❌ Failed. Reason: {preview}")
             return
@@ -592,6 +708,55 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ PDF processing failed.")
 
 # ======================
+# TEXT HANDLER (forwarded MCQ text + article/YouTube URLs)
+# ======================
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    text = update.message.text.strip()
+
+    if text.startswith("http://") or text.startswith("https://"):
+        youtube_id = extract_youtube_id(text)
+
+        if youtube_id:
+            await update.message.reply_text("🎥 YouTube link! Fetching transcript...")
+            transcript = await get_youtube_transcript(youtube_id)
+            if not transcript:
+                await update.message.reply_text("❌ No transcript. Trying page content...")
+                transcript = await fetch_url_content(text)
+            if not transcript:
+                await update.message.reply_text("❌ Could not extract content.")
+                return
+            await update.message.reply_text("⏳ Generating MCQ from video...")
+            await asyncio.sleep(20)
+            mcq = await generate_mcq(transcript)
+            source = "YouTube: " + text[:50]
+        else:
+            await update.message.reply_text("🔗 Article URL! Fetching content...")
+            content = await fetch_url_content(text)
+            if not content:
+                await update.message.reply_text("❌ Could not fetch content.")
+                return
+            await update.message.reply_text("⏳ Generating MCQ from article...")
+            await asyncio.sleep(20)
+            mcq = await generate_mcq(content)
+            source = "Article: " + text[:50]
+
+        if not mcq:
+            await update.message.reply_text("❌ Failed to generate MCQ.")
+            return
+        await send_for_approval(context.bot, mcq, source)
+
+    else:
+        await update.message.reply_text("💬 Forwarded MCQ text detected! Processing...")
+        mcq = await rephrase_forwarded_mcq(text)
+        if not mcq:
+            await update.message.reply_text("❌ Could not process MCQ.")
+            return
+        await send_for_approval(context.bot, mcq, "Forwarded MCQ")
+
+# ======================
 # COMMANDS
 # ======================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -611,7 +776,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/debug - Test bot connectivity\n"
         "/resettopics - Clear used topics\n"
         "/resetquestions - Clear used questions\n\n"
-        "📎 Send PDF or photo → auto MCQ!\n\n"
+        "📎 Send:\n"
+        "📝 Forwarded MCQ text → rephrase & post\n"
+        "📊 Forwarded MCQ poll → rephrase & post\n"
+        "📄 PDF → extract & generate MCQ\n"
+        "🖼 Image → analyze & generate MCQ\n"
+        "🔗 Article URL → scrape & generate MCQ\n"
+        "🎥 YouTube URL → transcript & generate MCQ\n\n"
         "🔄 Scheduled MCQs alternate Biochem → Pharma → Biochem..."
     )
 
@@ -709,6 +880,8 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
     app.add_handler(MessageHandler(filters.PHOTO, handle_image))
+    app.add_handler(MessageHandler(filters.POLL, handle_forwarded_poll))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     app.job_queue.run_repeating(
         scheduled_job,
