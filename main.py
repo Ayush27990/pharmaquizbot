@@ -977,7 +977,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ======================
 def main():
     global NEET_PHARMA_CHUNKS
-    NEET_PHARMA_CHUNKS = load_pdf_chunks("books/NEET PG Pharmacology Book 2025 (1).pdf")
+    NEET_PHARMA_CHUNKS = load_pdf_chunks("books/neet_pharma.pdf")
+
     logger.info(f"NEET Pharma chunks loaded: {len(NEET_PHARMA_CHUNKS)}")
 
     logger.info("Starting Pharma Quiz Bot...")
