@@ -981,7 +981,8 @@ def main():
 
     logger.info(f"NEET Pharma chunks loaded: {len(NEET_PHARMA_CHUNKS)}")
 
-    logger.info("Starting Pharma Quiz Bot...")
+    logger.info("Starting Pharma Quiz Bot v2...")
+
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
