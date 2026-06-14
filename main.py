@@ -72,6 +72,31 @@ def save_json(filename, data):
 used_topics = load_json("used_topics.json", [])
 used_questions = load_json("used_questions.json", [])
 last_subject = load_json("last_subject.json", {"subject": "pharma"})
+used_neet_chunks = load_json("used_neet_chunks.json", [])
+NEET_PHARMA_CHUNKS = []
+
+# ======================
+# PDF LOADER
+# ======================
+def load_pdf_chunks(filepath, chunk_size=3000):
+    chunks = []
+    try:
+        with open(filepath, "rb") as f:
+            reader = PyPDF2.PdfReader(f)
+            current_chunk = ""
+            for page in reader.pages:
+                text = page.extract_text() or ""
+                current_chunk += text + "\n"
+                if len(current_chunk) >= chunk_size:
+                    chunks.append(current_chunk[:chunk_size])
+                    current_chunk = current_chunk[chunk_size:]
+            if current_chunk.strip():
+                chunks.append(current_chunk)
+        logger.info(f"Loaded {len(chunks)} chunks from {filepath}")
+        return chunks
+    except Exception as e:
+        logger.error(f"PDF load error: {e}")
+        return []
 
 # ======================
 # TOPIC POOLS
@@ -269,8 +294,12 @@ async def fetch_url_content(url):
 # ALTERNATING SUBJECT
 # ======================
 def get_next_subject():
-    current = last_subject.get("subject", "pharma")
-    next_subject = "harper" if current == "goodman" else "goodman"
+    rotation = ["harper", "goodman", "neet_pharma"]
+    current = last_subject.get("subject", "goodman")
+    try:
+        next_subject = rotation[(rotation.index(current) + 1) % len(rotation)]
+    except ValueError:
+        next_subject = "harper"
     last_subject["subject"] = next_subject
     save_json("last_subject.json", last_subject)
     return next_subject
@@ -316,6 +345,25 @@ async def generate_topic(book=None):
         return topic
 
 # ======================
+# NEET PHARMA CHUNK PICKER
+# ======================
+async def get_neet_pharma_chunk():
+    if not NEET_PHARMA_CHUNKS:
+        return None
+    available = [i for i in range(len(NEET_PHARMA_CHUNKS))
+                 if i not in used_neet_chunks]
+    if not available:
+        used_neet_chunks.clear()
+        save_json("used_neet_chunks.json", used_neet_chunks)
+        available = list(range(len(NEET_PHARMA_CHUNKS)))
+    idx = random.choice(available)
+    used_neet_chunks.append(idx)
+    if len(used_neet_chunks) > 300:
+        used_neet_chunks.pop(0)
+    save_json("used_neet_chunks.json", used_neet_chunks)
+    return NEET_PHARMA_CHUNKS[idx]
+
+# ======================
 # GENERATE MCQ
 # ======================
 async def generate_mcq(content, book_context=None, retry=0):
@@ -328,6 +376,12 @@ async def generate_mcq(content, book_context=None, retry=0):
         source_context = (
             "Based on Goodman & Gilman's Pharmacological Basis of Therapeutics. "
             "Reference drug mechanisms, receptor pharmacology, and clinical applications."
+        )
+    elif book_context == "neet_pharma":
+        source_context = (
+            "Based on NEET PG Pharmacology 2025 edition. "
+            "Focus on high-yield exam topics, drug mechanisms, receptor pharmacology, "
+            "and clinical applications relevant to NEET PG exam."
         )
     else:
         source_context = "Based on standard NEET PG / USMLE medical curriculum."
@@ -564,17 +618,28 @@ async def scheduled_job(context: ContextTypes.DEFAULT_TYPE):
         subject = get_next_subject()
         logger.info(f"Scheduled job — subject: {subject}")
 
-        topic = await generate_topic(book=subject)
-        logger.info("Generated topic: " + topic)
-        await asyncio.sleep(20)
+        if subject == "neet_pharma":
+            chunk = await get_neet_pharma_chunk()
+            if not chunk:
+                logger.error("No NEET Pharma chunks available")
+                return
+            await asyncio.sleep(20)
+            mcq = await generate_mcq(chunk, book_context="neet_pharma")
+            if not mcq:
+                logger.error("Failed to generate MCQ")
+                return
+            await send_for_approval(context.bot, mcq, "NEET PG Pharmacology 2025")
+        else:
+            topic = await generate_topic(book=subject)
+            logger.info("Generated topic: " + topic)
+            await asyncio.sleep(20)
+            mcq = await generate_mcq(topic, book_context=subject)
+            if not mcq:
+                logger.error("Failed to generate MCQ")
+                return
+            label = "Harper 33e" if subject == "harper" else "Goodman & Gilman"
+            await send_for_approval(context.bot, mcq, f"{label}: {topic}")
 
-        mcq = await generate_mcq(topic, book_context=subject)
-        if not mcq:
-            logger.error("Failed to generate MCQ")
-            return
-
-        label = "Harper 33e" if subject == "harper" else "Goodman & Gilman"
-        await send_for_approval(context.bot, mcq, f"{label}: {topic}")
     except Exception as e:
         logger.error("Scheduled job error: " + str(e))
 
@@ -611,20 +676,34 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             book = "harper"
         elif "Goodman" in source:
             book = "goodman"
+        elif "NEET" in source:
+            book = "neet_pharma"
         else:
             book = get_next_subject()
 
-        topic = await generate_topic(book=book)
-        await asyncio.sleep(20)
-        mcq = await generate_mcq(topic, book_context=book)
-        if mcq:
-            label = "Harper 33e" if book == "harper" else "Goodman & Gilman"
-            await send_for_approval(context.bot, mcq, f"{label}: {topic}")
+        if book == "neet_pharma":
+            chunk = await get_neet_pharma_chunk()
+            if not chunk:
+                await context.bot.send_message(chat_id=ADMIN_ID, text="❌ No NEET chunks. Try /postnow")
+                return
+            await asyncio.sleep(20)
+            mcq = await generate_mcq(chunk, book_context="neet_pharma")
+            if mcq:
+                await send_for_approval(context.bot, mcq, "NEET PG Pharmacology 2025")
+            else:
+                await context.bot.send_message(chat_id=ADMIN_ID, text="❌ Failed to regenerate. Try /postnow")
         else:
-            await context.bot.send_message(
-                chat_id=ADMIN_ID,
-                text="❌ Failed to regenerate. Try /postnow"
-            )
+            topic = await generate_topic(book=book)
+            await asyncio.sleep(20)
+            mcq = await generate_mcq(topic, book_context=book)
+            if mcq:
+                label = "Harper 33e" if book == "harper" else "Goodman & Gilman"
+                await send_for_approval(context.bot, mcq, f"{label}: {topic}")
+            else:
+                await context.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text="❌ Failed to regenerate. Try /postnow"
+                )
 
 # ======================
 # FORWARDED POLL HANDLER
@@ -708,7 +787,7 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ PDF processing failed.")
 
 # ======================
-# TEXT HANDLER (forwarded MCQ text + article/YouTube URLs)
+# TEXT HANDLER
 # ======================
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -769,7 +848,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "✅ Pharma Quiz Bot Running!\n\n"
         "📚 Book Commands:\n"
         "/harper - MCQ from Harper Biochemistry 33rd Ed\n"
-        "/goodman - MCQ from Goodman & Gilman\n\n"
+        "/goodman - MCQ from Goodman & Gilman\n"
+        "/neetpharma - MCQ from NEET PG Pharmacology 2025\n\n"
         "🤖 Other Commands:\n"
         "/postnow - Generate next alternating MCQ\n"
         "/status - Check bot status\n"
@@ -783,7 +863,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🖼 Image → analyze & generate MCQ\n"
         "🔗 Article URL → scrape & generate MCQ\n"
         "🎥 YouTube URL → transcript & generate MCQ\n\n"
-        "🔄 Scheduled MCQs alternate Biochem → Pharma → Biochem..."
+        "🔄 Scheduled MCQs rotate: Biochem → Pharma → NEET Pharma → ..."
     )
 
 async def harper_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -812,6 +892,24 @@ async def goodman_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await send_for_approval(context.bot, mcq, f"Goodman & Gilman: {topic}")
 
+async def neet_pharma_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if not NEET_PHARMA_CHUNKS:
+        await update.message.reply_text("❌ NEET Pharma PDF not loaded. Check books/ folder on Railway.")
+        return
+    await update.message.reply_text(
+        f"💊 Generating MCQ from NEET PG Pharmacology 2025...\n"
+        f"📚 {len(NEET_PHARMA_CHUNKS)} chunks available"
+    )
+    chunk = await get_neet_pharma_chunk()
+    await asyncio.sleep(20)
+    mcq = await generate_mcq(chunk, book_context="neet_pharma")
+    if not mcq:
+        await update.message.reply_text("❌ Failed to generate MCQ.")
+        return
+    await send_for_approval(context.bot, mcq, "NEET PG Pharmacology 2025")
+
 async def reset_topics_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
@@ -828,7 +926,12 @@ async def reset_questions_command(update: Update, context: ContextTypes.DEFAULT_
 
 async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    next_up = "Pharmacology" if last_subject.get("subject") == "harper" else "Biochemistry"
+    rotation = ["harper", "goodman", "neet_pharma"]
+    current = last_subject.get("subject", "goodman")
+    try:
+        next_up = rotation[(rotation.index(current) + 1) % len(rotation)]
+    except ValueError:
+        next_up = "harper"
     await update.message.reply_text(
         f"🔧 Debug Info\n"
         f"Your ID: {user_id}\n"
@@ -839,7 +942,8 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Questions used: {len(used_questions)}\n"
         f"Next scheduled subject: {next_up}\n"
         f"Harper remaining: {len([t for t in HARPER_TOPICS if t not in used_topics])}/40\n"
-        f"Goodman remaining: {len([t for t in GOODMAN_TOPICS if t not in used_topics])}/40"
+        f"Goodman remaining: {len([t for t in GOODMAN_TOPICS if t not in used_topics])}/40\n"
+        f"NEET Pharma chunks: {len(NEET_PHARMA_CHUNKS)} loaded, {len(used_neet_chunks)} used"
     )
 
 async def post_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -851,7 +955,12 @@ async def post_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
-    next_up = "Pharmacology" if last_subject.get("subject") == "harper" else "Biochemistry"
+    rotation = ["harper", "goodman", "neet_pharma"]
+    current = last_subject.get("subject", "goodman")
+    try:
+        next_up = rotation[(rotation.index(current) + 1) % len(rotation)]
+    except ValueError:
+        next_up = "harper"
     await update.message.reply_text(
         "✅ Bot is running\n"
         "📊 Pending approvals: " + str(len(pending_questions)) + "\n"
@@ -859,13 +968,18 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "❓ Questions used: " + str(len(used_questions)) + "\n"
         f"🔄 Next subject: {next_up}\n"
         f"🧬 Harper remaining: {len([t for t in HARPER_TOPICS if t not in used_topics])}/40\n"
-        f"💊 Goodman remaining: {len([t for t in GOODMAN_TOPICS if t not in used_topics])}/40"
+        f"💊 Goodman remaining: {len([t for t in GOODMAN_TOPICS if t not in used_topics])}/40\n"
+        f"📖 NEET Pharma: {len(NEET_PHARMA_CHUNKS)} chunks, {len(used_neet_chunks)} used"
     )
 
 # ======================
 # MAIN
 # ======================
 def main():
+    global NEET_PHARMA_CHUNKS
+    NEET_PHARMA_CHUNKS = load_pdf_chunks("books/NEET PG Pharmacology Book 2025 (1).pdf")
+    logger.info(f"NEET Pharma chunks loaded: {len(NEET_PHARMA_CHUNKS)}")
+
     logger.info("Starting Pharma Quiz Bot...")
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
@@ -874,6 +988,7 @@ def main():
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("harper", harper_command))
     app.add_handler(CommandHandler("goodman", goodman_command))
+    app.add_handler(CommandHandler("neetpharma", neet_pharma_command))
     app.add_handler(CommandHandler("debug", debug_command))
     app.add_handler(CommandHandler("resettopics", reset_topics_command))
     app.add_handler(CommandHandler("resetquestions", reset_questions_command))
