@@ -250,17 +250,23 @@ def make_unique_qid():
     return f"{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
 
 async def safe_groq_call(**kwargs):
-    for attempt in range(3):
+    for attempt in range(4):
         try:
             return client.chat.completions.create(**kwargs)
         except Exception as e:
-            if "rate_limit" in str(e).lower() or "429" in str(e):
+            err = str(e).lower()
+            if "rate_limit" in err or "429" in err:
                 wait = 30 * (attempt + 1)
-                logger.warning(f"Rate limit hit, waiting {wait}s...")
+                logger.warning(f"Rate limit hit (attempt {attempt+1}), waiting {wait}s...")
+                await asyncio.sleep(wait)
+            elif "timeout" in err or "connection" in err or "503" in err or "502" in err or "overloaded" in err:
+                wait = 15 * (attempt + 1)
+                logger.warning(f"Transient Groq error (attempt {attempt+1}): {e} — retrying in {wait}s...")
                 await asyncio.sleep(wait)
             else:
-                logger.error(f"Groq error: {e}")
+                logger.error(f"Groq fatal error: {e}")
                 return None
+    logger.error("safe_groq_call: all attempts exhausted")
     return None
 
 # ======================
@@ -737,9 +743,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🔄 Regenerating MCQ on same topic...\n📚 Source: {source}"
         )
 
-        # 3. Generate new MCQ on the same topic/content
-        await asyncio.sleep(20)
-        mcq = await generate_mcq(topic_content, book_context=book)
+        # 3. Generate new MCQ — retry up to 3 times with short delays
+        await asyncio.sleep(5)
+        mcq = None
+        for regen_attempt in range(3):
+            mcq = await generate_mcq(topic_content, book_context=book)
+            if mcq:
+                break
+            logger.warning(f"Regen attempt {regen_attempt+1} failed, retrying in 15s...")
+            await asyncio.sleep(15)
 
         if mcq:
             await send_for_approval(
@@ -750,9 +762,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=ADMIN_ID,
                 text=(
-                    "❌ Regeneration failed.\n"
-                    f"Topic was: {source}\n"
-                    "Try /postnow to generate a new MCQ."
+                    "❌ Regeneration failed after 3 attempts (Groq API issue).\n"
+                    f"Topic was: {source}\n\n"
+                    "Wait 1-2 min and try /postnow, or use /harper or /goodman directly."
                 )
             )
 
