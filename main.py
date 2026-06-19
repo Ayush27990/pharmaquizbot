@@ -50,7 +50,6 @@ if not CHANNEL_ID:
     raise ValueError("CHANNEL_ID missing")
 
 client = Groq(api_key=GROQ_API_KEY)
-pending_questions = {}
 
 # ======================
 # PERSISTENCE
@@ -73,6 +72,17 @@ used_topics = load_json("used_topics.json", [])
 used_questions = load_json("used_questions.json", [])
 last_subject = load_json("last_subject.json", {"subject": "pharma"})
 used_neet_chunks = load_json("used_neet_chunks.json", [])
+
+# pending_questions now persisted to disk so it survives bot restarts/redeploys.
+# Previously this was an in-memory-only dict, which meant that if the process
+# restarted between sending an MCQ for approval and the admin tapping a button,
+# the qid would no longer exist and Approve/Regenerate would fail with
+# "expired" / "original topic not found" — exactly the bug being fixed here.
+pending_questions = load_json("pending_questions.json", {})
+
+def save_pending_questions():
+    save_json("pending_questions.json", pending_questions)
+
 NEET_PHARMA_CHUNKS = []
 
 # ======================
@@ -527,13 +537,15 @@ async def generate_mcq_from_image(image_bytes, mime_type="image/jpeg"):
 # ======================
 async def send_for_approval(bot, mcq, source, topic_content=None, book_context=None):
     try:
-        qid = str(int(time.time()))
+        qid = str(int(time.time() * 1000))  # millisecond precision avoids collisions
         pending_questions[qid] = {
             "mcq": mcq,
             "source": source,
             "topic_content": topic_content,
             "book_context": book_context,
         }
+        save_pending_questions()
+
         correct_option = mcq["options"][mcq["answer_index"]]
 
         options_preview = []
@@ -668,6 +680,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if item:
             await post_to_channel(context.bot, item["mcq"])
             pending_questions.pop(qid, None)
+            save_pending_questions()
             await query.edit_message_text("✅ Posted to channel!")
         else:
             await query.edit_message_text("❌ Question expired.")
@@ -675,11 +688,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("reject_"):
         qid = data.replace("reject_", "")
         pending_questions.pop(qid, None)
+        save_pending_questions()
         await query.edit_message_text("❌ Rejected.")
 
     elif data.startswith("regen_"):
         qid = data.replace("regen_", "")
         old_item = pending_questions.pop(qid, None)
+        save_pending_questions()
         await query.edit_message_text("🔄 Regenerating (same topic)...")
 
         if not old_item or not old_item.get("topic_content"):
@@ -993,6 +1008,7 @@ def main():
     NEET_PHARMA_CHUNKS = load_pdf_chunks("books/neet_pharma.pdf")
 
     logger.info(f"NEET Pharma chunks loaded: {len(NEET_PHARMA_CHUNKS)}")
+    logger.info(f"Pending questions restored from disk: {len(pending_questions)}")
 
     logger.info("Starting Pharma Quiz Bot v2...")
 
