@@ -40,7 +40,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 ADMIN_ID = 723919716
-INTERVAL = 900  
+INTERVAL = 900
 
 if not TELEGRAM_TOKEN:
     raise ValueError("TELEGRAM_TOKEN missing")
@@ -65,19 +65,17 @@ def save_json(filename, data):
     try:
         with open(filename, "w") as f:
             json.dump(data, f)
-    except:
-        pass
+    except Exception as e:
+        logger.error(f"save_json error ({filename}): {e}")
 
 used_topics = load_json("used_topics.json", [])
 used_questions = load_json("used_questions.json", [])
 last_subject = load_json("last_subject.json", {"subject": "pharma"})
 used_neet_chunks = load_json("used_neet_chunks.json", [])
 
-# pending_questions now persisted to disk so it survives bot restarts/redeploys.
-# Previously this was an in-memory-only dict, which meant that if the process
-# restarted between sending an MCQ for approval and the admin tapping a button,
-# the qid would no longer exist and Approve/Regenerate would fail with
-# "expired" / "original topic not found" — exactly the bug being fixed here.
+# pending_questions persisted to disk so it survives restarts.
+# Key: unique qid (millisecond timestamp + random suffix)
+# Value: {"mcq": {...}, "source": "...", "topic_content": "...", "book_context": "..."}
 pending_questions = load_json("pending_questions.json", {})
 
 def save_pending_questions():
@@ -246,6 +244,10 @@ def mark_question_used(question_text):
     if len(used_questions) > 500:
         used_questions.pop(0)
     save_json("used_questions.json", used_questions)
+
+def make_unique_qid():
+    """Generate a collision-proof unique ID using ms timestamp + random suffix."""
+    return f"{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
 
 async def safe_groq_call(**kwargs):
     for attempt in range(3):
@@ -536,17 +538,21 @@ async def generate_mcq_from_image(image_bytes, mime_type="image/jpeg"):
 # SEND FOR APPROVAL
 # ======================
 async def send_for_approval(bot, mcq, source, topic_content=None, book_context=None):
+    """
+    Stores the pending question and sends it to admin for approval.
+    Uses a collision-proof unique ID (ms timestamp + random suffix).
+    """
     try:
-        qid = str(int(time.time() * 1000))  # millisecond precision avoids collisions
+        qid = make_unique_qid()
+
+        # Store BEFORE sending so the data is always available when buttons are tapped
         pending_questions[qid] = {
             "mcq": mcq,
             "source": source,
-            "topic_content": topic_content,
+            "topic_content": topic_content,   # REQUIRED for Regenerate to work
             "book_context": book_context,
         }
         save_pending_questions()
-
-        correct_option = mcq["options"][mcq["answer_index"]]
 
         options_preview = []
         for i, opt in enumerate(mcq["options"]):
@@ -575,7 +581,7 @@ async def send_for_approval(bot, mcq, source, topic_content=None, book_context=N
             text=text,
             reply_markup=keyboard
         )
-        logger.info("MCQ sent for approval: " + source)
+        logger.info(f"MCQ sent for approval (qid={qid}): {source}")
     except Exception as e:
         logger.error("Send for approval error: " + str(e))
 
@@ -667,49 +673,74 @@ async def scheduled_job(context: ContextTypes.DEFAULT_TYPE):
         logger.error("Scheduled job error: " + str(e))
 
 # ======================
-# CALLBACK HANDLER
+# CALLBACK HANDLER  ← FIXED REGENERATE LOGIC HERE
 # ======================
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
 
+    # ── APPROVE ──────────────────────────────────────────────
     if data.startswith("approve_"):
         qid = data.replace("approve_", "")
         item = pending_questions.get(qid)
-        if item:
-            await post_to_channel(context.bot, item["mcq"])
-            pending_questions.pop(qid, None)
-            save_pending_questions()
-            await query.edit_message_text("✅ Posted to channel!")
-        else:
-            await query.edit_message_text("❌ Question expired.")
-
-    elif data.startswith("reject_"):
-        qid = data.replace("reject_", "")
+        if not item:
+            await query.edit_message_text("❌ Question expired or already handled.")
+            return
+        await post_to_channel(context.bot, item["mcq"])
         pending_questions.pop(qid, None)
         save_pending_questions()
+        await query.edit_message_text("✅ Posted to channel!")
+
+    # ── REJECT ───────────────────────────────────────────────
+    elif data.startswith("reject_"):
+        qid = data.replace("reject_", "")
+        if qid in pending_questions:
+            pending_questions.pop(qid, None)
+            save_pending_questions()
         await query.edit_message_text("❌ Rejected.")
 
+    # ── REGENERATE ───────────────────────────────────────────
     elif data.startswith("regen_"):
         qid = data.replace("regen_", "")
-        old_item = pending_questions.pop(qid, None)
-        save_pending_questions()
-        await query.edit_message_text("🔄 Regenerating (same topic)...")
 
-        if not old_item or not old_item.get("topic_content"):
-            await context.bot.send_message(
-                chat_id=ADMIN_ID,
-                text="❌ Can't regenerate — original topic not found. Try /postnow"
+        # 1. Read the item FIRST — do NOT pop yet
+        old_item = pending_questions.get(qid)
+
+        if not old_item:
+            await query.edit_message_text(
+                "❌ Could not find the original question.\n"
+                "It may have already been regenerated or the bot restarted.\n"
+                "Use /postnow to generate a new one."
             )
             return
 
-        topic_content = old_item["topic_content"]
+        topic_content = old_item.get("topic_content")
         book = old_item.get("book_context")
-        source = old_item["source"]
+        source = old_item.get("source", "Unknown Source")
 
+        if not topic_content:
+            # No content to regenerate from — remove stale entry and abort
+            pending_questions.pop(qid, None)
+            save_pending_questions()
+            await query.edit_message_text(
+                "❌ No topic content stored for this question.\n"
+                "Use /postnow to generate a fresh MCQ."
+            )
+            return
+
+        # 2. NOW remove the old entry and save
+        pending_questions.pop(qid, None)
+        save_pending_questions()
+
+        await query.edit_message_text(
+            f"🔄 Regenerating MCQ on same topic...\n📚 Source: {source}"
+        )
+
+        # 3. Generate new MCQ on the same topic/content
         await asyncio.sleep(20)
         mcq = await generate_mcq(topic_content, book_context=book)
+
         if mcq:
             await send_for_approval(
                 context.bot, mcq, source,
@@ -718,7 +749,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await context.bot.send_message(
                 chat_id=ADMIN_ID,
-                text="❌ Failed to regenerate. Try /postnow"
+                text=(
+                    "❌ Regeneration failed.\n"
+                    f"Topic was: {source}\n"
+                    "Try /postnow to generate a new MCQ."
+                )
             )
 
 # ======================
@@ -882,7 +917,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔗 Article URL → scrape & generate MCQ\n"
         "🎥 YouTube URL → transcript & generate MCQ\n\n"
         "🔄 Scheduled MCQs rotate: Biochem → Pharma → NEET Pharma → ...\n"
-        "🔄 Regenerate now rephrases the SAME topic instead of picking a new one."
+        "🔄 Regenerate rephrases the SAME topic instead of picking a new one."
     )
 
 async def harper_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
