@@ -383,7 +383,8 @@ async def get_neet_pharma_chunk() -> str | None:
 # ======================
 # MCQ GENERATION
 # ======================
-async def generate_mcq(content: str, book_context: str = None, retry: int = 0):
+async def generate_mcq(content: str, book_context: str = None, retry: int = 0,
+                       auto_select_topic: bool = False):
     ctx_map = {
         "harper":      "Based on Harper's Illustrated Biochemistry 33rd Edition. Reference Harper's chapter topics, enzyme names, and clinical correlations.",
         "goodman":     "Based on Goodman & Gilman's Pharmacological Basis of Therapeutics. Reference drug mechanisms, receptor pharmacology, and clinical applications.",
@@ -391,10 +392,18 @@ async def generate_mcq(content: str, book_context: str = None, retry: int = 0):
     }
     source_context = ctx_map.get(book_context, "Based on standard NEET PG / USMLE medical curriculum.")
 
+    if auto_select_topic:
+        # Pick a topic internally so we only need one API call total
+        topic = await generate_topic(book=book_context)
+        mcq_content = topic
+    else:
+        topic = None
+        mcq_content = content
+
     prompt = (
         "You are a NEET PG / USMLE / FMGE expert examiner.\n\n"
         + source_context + "\n\n"
-        "Generate ONE high-yield clinical MCQ based on: " + content + "\n\n"
+        "Generate ONE high-yield clinical MCQ based on: " + mcq_content + "\n\n"
         "Rules:\n"
         "- Clinical vignette style with patient scenario\n"
         "- 4 options labeled ONLY as A, B, C, D (no punctuation after letter)\n"
@@ -445,10 +454,14 @@ async def generate_mcq(content: str, book_context: str = None, retry: int = 0):
             logger.warning("Duplicate question, retrying…")
             if retry < 2:
                 await asyncio.sleep(5)
-                return await generate_mcq(content, book_context, retry=retry + 1)
+                return await generate_mcq(content, book_context, retry=retry + 1,
+                                          auto_select_topic=auto_select_topic)
             logger.warning("Still duplicate after retries — using anyway")
 
         mark_question_used(mcq["question"])
+        # Attach the internally-selected topic so callers can use it for labels
+        if auto_select_topic and topic:
+            mcq["_selected_topic"] = topic
         return mcq
 
     except Exception as e:
@@ -634,12 +647,12 @@ async def scheduled_job(context: ContextTypes.DEFAULT_TYPE):
             await send_for_approval(context.bot, mcq, "NEET PG Pharmacology 2025",
                                     topic_content=chunk, book_context="neet_pharma")
         else:
-            topic = await generate_topic(book=subject)
-            logger.info(f"Generated topic: {topic}")
-            mcq = await generate_mcq(topic, book_context=subject)
+            mcq = await generate_mcq("", book_context=subject, auto_select_topic=True)
             if not mcq:
                 logger.error("Failed to generate MCQ")
                 return
+            topic = mcq.get("_selected_topic", subject)
+            logger.info(f"Selected topic: {topic}")
             label = "Harper 33e" if subject == "harper" else "Goodman & Gilman"
             await send_for_approval(context.bot, mcq, f"{label}: {topic}",
                                     topic_content=topic, book_context=subject)
@@ -902,12 +915,12 @@ async def harper_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
     await update.message.reply_text("📖 Generating MCQ from Harper's Biochemistry 33rd Edition…")
-    topic = await generate_topic(book="harper")
-    await update.message.reply_text(f"🧬 Topic: {topic}")
-    mcq = await generate_mcq(topic, book_context="harper")
+    mcq = await generate_mcq("", book_context="harper", auto_select_topic=True)
     if not mcq:
         await update.message.reply_text("❌ Failed to generate MCQ.")
         return
+    topic = mcq.get("_selected_topic", "Harper Biochemistry")
+    await update.message.reply_text(f"🧬 Topic: {topic}")
     await send_for_approval(context.bot, mcq, f"Harper 33e: {topic}",
                             topic_content=topic, book_context="harper")
 
@@ -915,12 +928,12 @@ async def goodman_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
     await update.message.reply_text("💊 Generating MCQ from Goodman & Gilman…")
-    topic = await generate_topic(book="goodman")
-    await update.message.reply_text(f"💉 Topic: {topic}")
-    mcq = await generate_mcq(topic, book_context="goodman")
+    mcq = await generate_mcq("", book_context="goodman", auto_select_topic=True)
     if not mcq:
         await update.message.reply_text("❌ Failed to generate MCQ.")
         return
+    topic = mcq.get("_selected_topic", "Goodman & Gilman")
+    await update.message.reply_text(f"💉 Topic: {topic}")
     await send_for_approval(context.bot, mcq, f"Goodman & Gilman: {topic}",
                             topic_content=topic, book_context="goodman")
 
