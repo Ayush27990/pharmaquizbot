@@ -525,10 +525,15 @@ async def generate_mcq_from_image(image_bytes, mime_type="image/jpeg"):
 # ======================
 # SEND FOR APPROVAL
 # ======================
-async def send_for_approval(bot, mcq, source):
+async def send_for_approval(bot, mcq, source, topic_content=None, book_context=None):
     try:
         qid = str(int(time.time()))
-        pending_questions[qid] = {"mcq": mcq, "source": source}
+        pending_questions[qid] = {
+            "mcq": mcq,
+            "source": source,
+            "topic_content": topic_content,
+            "book_context": book_context,
+        }
         correct_option = mcq["options"][mcq["answer_index"]]
 
         options_preview = []
@@ -628,7 +633,10 @@ async def scheduled_job(context: ContextTypes.DEFAULT_TYPE):
             if not mcq:
                 logger.error("Failed to generate MCQ")
                 return
-            await send_for_approval(context.bot, mcq, "NEET PG Pharmacology 2025")
+            await send_for_approval(
+                context.bot, mcq, "NEET PG Pharmacology 2025",
+                topic_content=chunk, book_context="neet_pharma"
+            )
         else:
             topic = await generate_topic(book=subject)
             logger.info("Generated topic: " + topic)
@@ -638,7 +646,10 @@ async def scheduled_job(context: ContextTypes.DEFAULT_TYPE):
                 logger.error("Failed to generate MCQ")
                 return
             label = "Harper 33e" if subject == "harper" else "Goodman & Gilman"
-            await send_for_approval(context.bot, mcq, f"{label}: {topic}")
+            await send_for_approval(
+                context.bot, mcq, f"{label}: {topic}",
+                topic_content=topic, book_context=subject
+            )
 
     except Exception as e:
         logger.error("Scheduled job error: " + str(e))
@@ -669,41 +680,31 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("regen_"):
         qid = data.replace("regen_", "")
         old_item = pending_questions.pop(qid, None)
-        await query.edit_message_text("🔄 Regenerating...")
+        await query.edit_message_text("🔄 Regenerating (same topic)...")
 
-        source = old_item["source"] if old_item else ""
-        if "Harper" in source:
-            book = "harper"
-        elif "Goodman" in source:
-            book = "goodman"
-        elif "NEET" in source:
-            book = "neet_pharma"
-        else:
-            book = get_next_subject()
+        if not old_item or not old_item.get("topic_content"):
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text="❌ Can't regenerate — original topic not found. Try /postnow"
+            )
+            return
 
-        if book == "neet_pharma":
-            chunk = await get_neet_pharma_chunk()
-            if not chunk:
-                await context.bot.send_message(chat_id=ADMIN_ID, text="❌ No NEET chunks. Try /postnow")
-                return
-            await asyncio.sleep(20)
-            mcq = await generate_mcq(chunk, book_context="neet_pharma")
-            if mcq:
-                await send_for_approval(context.bot, mcq, "NEET PG Pharmacology 2025")
-            else:
-                await context.bot.send_message(chat_id=ADMIN_ID, text="❌ Failed to regenerate. Try /postnow")
+        topic_content = old_item["topic_content"]
+        book = old_item.get("book_context")
+        source = old_item["source"]
+
+        await asyncio.sleep(20)
+        mcq = await generate_mcq(topic_content, book_context=book)
+        if mcq:
+            await send_for_approval(
+                context.bot, mcq, source,
+                topic_content=topic_content, book_context=book
+            )
         else:
-            topic = await generate_topic(book=book)
-            await asyncio.sleep(20)
-            mcq = await generate_mcq(topic, book_context=book)
-            if mcq:
-                label = "Harper 33e" if book == "harper" else "Goodman & Gilman"
-                await send_for_approval(context.bot, mcq, f"{label}: {topic}")
-            else:
-                await context.bot.send_message(
-                    chat_id=ADMIN_ID,
-                    text="❌ Failed to regenerate. Try /postnow"
-                )
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text="❌ Failed to regenerate. Try /postnow"
+            )
 
 # ======================
 # FORWARDED POLL HANDLER
@@ -726,7 +727,7 @@ async def handle_forwarded_poll(update: Update, context: ContextTypes.DEFAULT_TY
         if not mcq:
             await update.message.reply_text("❌ Could not process poll.")
             return
-        await send_for_approval(context.bot, mcq, "Forwarded Poll")
+        await send_for_approval(context.bot, mcq, "Forwarded Poll", topic_content=text, book_context=None)
     except Exception as e:
         logger.error("Forwarded poll error: " + str(e))
         await update.message.reply_text("❌ Failed to process poll.")
@@ -750,7 +751,7 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not mcq:
             await update.message.reply_text(f"❌ Failed. Reason: {preview}")
             return
-        await send_for_approval(context.bot, mcq, "Image Upload")
+        await send_for_approval(context.bot, mcq, "Image Upload", topic_content=preview, book_context=None)
     except Exception as e:
         logger.error("Image handler error: " + str(e))
         await update.message.reply_text("❌ Image processing failed: " + str(e))
@@ -781,7 +782,7 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not mcq:
             await update.message.reply_text("❌ Failed to generate MCQ.")
             return
-        await send_for_approval(context.bot, mcq, "PDF Upload")
+        await send_for_approval(context.bot, mcq, "PDF Upload", topic_content=text, book_context=None)
     except Exception as e:
         logger.error("PDF error: " + str(e))
         await update.message.reply_text("❌ PDF processing failed.")
@@ -811,6 +812,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(20)
             mcq = await generate_mcq(transcript)
             source = "YouTube: " + text[:50]
+            content_used = transcript
         else:
             await update.message.reply_text("🔗 Article URL! Fetching content...")
             content = await fetch_url_content(text)
@@ -821,11 +823,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(20)
             mcq = await generate_mcq(content)
             source = "Article: " + text[:50]
+            content_used = content
 
         if not mcq:
             await update.message.reply_text("❌ Failed to generate MCQ.")
             return
-        await send_for_approval(context.bot, mcq, source)
+        await send_for_approval(context.bot, mcq, source, topic_content=content_used, book_context=None)
 
     else:
         await update.message.reply_text("💬 Forwarded MCQ text detected! Processing...")
@@ -833,7 +836,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not mcq:
             await update.message.reply_text("❌ Could not process MCQ.")
             return
-        await send_for_approval(context.bot, mcq, "Forwarded MCQ")
+        await send_for_approval(context.bot, mcq, "Forwarded MCQ", topic_content=text, book_context=None)
 
 # ======================
 # COMMANDS
@@ -863,7 +866,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🖼 Image → analyze & generate MCQ\n"
         "🔗 Article URL → scrape & generate MCQ\n"
         "🎥 YouTube URL → transcript & generate MCQ\n\n"
-        "🔄 Scheduled MCQs rotate: Biochem → Pharma → NEET Pharma → ..."
+        "🔄 Scheduled MCQs rotate: Biochem → Pharma → NEET Pharma → ...\n"
+        "🔄 Regenerate now rephrases the SAME topic instead of picking a new one."
     )
 
 async def harper_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -877,7 +881,10 @@ async def harper_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not mcq:
         await update.message.reply_text("❌ Failed to generate MCQ.")
         return
-    await send_for_approval(context.bot, mcq, f"Harper 33e: {topic}")
+    await send_for_approval(
+        context.bot, mcq, f"Harper 33e: {topic}",
+        topic_content=topic, book_context="harper"
+    )
 
 async def goodman_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -890,7 +897,10 @@ async def goodman_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not mcq:
         await update.message.reply_text("❌ Failed to generate MCQ.")
         return
-    await send_for_approval(context.bot, mcq, f"Goodman & Gilman: {topic}")
+    await send_for_approval(
+        context.bot, mcq, f"Goodman & Gilman: {topic}",
+        topic_content=topic, book_context="goodman"
+    )
 
 async def neet_pharma_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -908,7 +918,10 @@ async def neet_pharma_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not mcq:
         await update.message.reply_text("❌ Failed to generate MCQ.")
         return
-    await send_for_approval(context.bot, mcq, "NEET PG Pharmacology 2025")
+    await send_for_approval(
+        context.bot, mcq, "NEET PG Pharmacology 2025",
+        topic_content=chunk, book_context="neet_pharma"
+    )
 
 async def reset_topics_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
